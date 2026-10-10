@@ -152,21 +152,35 @@ class DigitalTwinSimulator:
             "hops": hops,
             "wire_length": sum(wire_lengths) / len(wire_lengths) if wire_lengths else 0.0,
             "flow": flow,
+            "compute_link_bw": sum(e.bandwidth_tb_s for e in edges
+                                   if by_id.get(e.source) and by_id.get(e.target)
+                                   and "compute_cluster" in (by_id[e.source].type, by_id[e.target].type)),
         }
+
+    def _collective_factor(self, topology: Dict[str, float]) -> float:
+        """Collectives (measured share of device time) speed up with wider compute links."""
+        share = float(self.calibration.get("collective_share", 0.0))
+        base = float(self.calibration.get("baseline_compute_link_bw", 0.0))
+        if share <= 0 or base <= 0:
+            return 1.0
+        return 1.0 - share + share * base / max(topology.get("compute_link_bw", base), 1e-6)
 
     def _prefill_ms(self, prompt_tokens: int) -> float:
         topology = getattr(self, "_active_topology", None) or self._topology_profile()
         # Bytes and bandwidth use decimal units so the stated 2.9 TB/s baseline is literal.
         compute_ms, memory_ms = self._roofline(prompt_tokens)
         scale = float(self.calibration.get("prefill_scale", 1.0))
-        return (max(compute_ms, memory_ms, 0.05) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04) * scale
+        # Measured host-side overhead does not shrink on faster silicon; only device time scales.
+        hardware = (max(compute_ms, memory_ms, 0.05) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04) * scale
+        return float(self.calibration.get("prefill_overhead_ms", 0.0)) + hardware * self._collective_factor(topology)
 
     def _decode_token_ms(self, concurrent: int = 1) -> float:
         topology = getattr(self, "_active_topology", None) or self._topology_profile()
         # Each step streams weights once and reads per-sequence KV state.
         compute_ms, memory_ms = self._roofline(None)
         scale = float(self.calibration.get("decode_scale", 1.0))
-        return (max(compute_ms, memory_ms, 0.01) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04) * scale
+        hardware = (max(compute_ms, memory_ms, 0.01) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04) * scale
+        return float(self.calibration.get("decode_overhead_ms", 0.0)) + hardware * self._collective_factor(topology)
 
     def evaluate(
         self,
@@ -202,7 +216,11 @@ class DigitalTwinSimulator:
         # allocation, and a fixed work-buffer allowance.
         weight_gb = d.model_size_b * 1e9 * d.weight_bytes_per_parameter / 1e9
         max_kv_gb = max((r.prompt_tokens + r.output_tokens) * d.kv_bytes_per_token for r in workload.requests)
-        peak_memory = weight_gb + max_kv_gb + min(topology["sbuf_gb"], 8.0)
+        measured = self.calibration.get("memory_footprint_gb")
+        # Prefer the footprint measured on the device: vLLM preallocates its KV pool, so
+        # weights + KV + runtime buffers are already in it.
+        peak_memory = (max(float(measured), weight_gb + max_kv_gb) if measured
+                       else weight_gb + max_kv_gb + min(topology["sbuf_gb"], 8.0))
         memory_fit = peak_memory <= topology["hbm_gb"]
 
         # FCFS queue replay: requests are admitted by arrival time, then each

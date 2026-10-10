@@ -216,6 +216,10 @@ class CampaignOrchestrator:
                 line += (f" Device profile: arithmetic intensity {f(ai, 1)} FLOP/B vs ridge {f(ridge)} → "
                          f"{'memory' if ai < ridge else 'compute'}-bound; HBM bandwidth utilization {f(system.get('mbu_pct'))}%.")
             lines.append(line)
+        cal = campaign.get("calibration") or {}
+        if cal.get("prefill_overhead_ms"):
+            lines.append(f"Calibration: {f(cal['prefill_overhead_ms'])} ms of each prefill is host-side overhead that no chip change removes; "
+                         f"only the on-device part scales with hardware. Memory fit uses the measured {f(cal.get('memory_footprint_gb'), 1)} GB footprint.")
         if not campaign.get("baseline_feasible", True):
             failed = [row["label"] for row in campaign.get("baseline_checks") or [] if row.get("passed") is False]
             lines.append("Today's chip does not meet this scenario's budget (" + ", ".join(failed)
@@ -491,11 +495,32 @@ class CampaignOrchestrator:
         sim._active_topology = sim._topology_profile()
         modeled_prefill = max(sim._roofline(calibration["prompt_tokens"]))
         modeled_decode = max(sim._roofline(None))
+        # With a system trace, split each measured time into on-device time (which the
+        # roofline scales) and host overhead (which no chip change removes).
+        trace = system if system.get("available") else {}
+        neuron = telemetry.get("neuron_monitor") or {}
+        calibration.update(prefill_overhead_ms=0.0, decode_overhead_ms=0.0, collective_share=0.0,
+                           baseline_compute_link_bw=round(sim._active_topology.get("compute_link_bw", 0.0), 4),
+                           memory_footprint_gb=None, split_source="none")
         if live and vllm.get("prefill_ms"):
-            calibration["prefill_scale"] = round(clamp(vllm["prefill_ms"] / modeled_prefill), 4)
+            device = min(float(trace.get("prefill_step_ms") or vllm["prefill_ms"]), vllm["prefill_ms"])
+            calibration["prefill_overhead_ms"] = round(vllm["prefill_ms"] - device, 3)
+            calibration["prefill_scale"] = round(clamp(device / modeled_prefill), 4)
         if live and vllm.get("inter_token_ms"):
-            calibration["decode_scale"] = round(clamp(vllm["inter_token_ms"] / modeled_decode), 4)
-        sim.calibration = {k: calibration[k] for k in ("prefill_scale", "decode_scale", "spill_fraction")}
+            device = min(float(trace.get("decode_step_ms") or vllm["inter_token_ms"]), vllm["inter_token_ms"])
+            calibration["decode_overhead_ms"] = round(vllm["inter_token_ms"] - device, 3)
+            calibration["decode_scale"] = round(clamp(device / modeled_decode), 4)
+        if trace:
+            calibration["split_source"] = "system trace"
+            calibration["collective_share"] = round(float(trace.get("collective_pct") or 0.0) / 100.0, 4)
+            calibration["device_busy_pct"] = trace.get("device_busy_pct")
+        footprint = trace.get("hbm_used_gb") or (neuron.get("device_memory_gb") if neuron.get("available") else None)
+        if live and footprint:
+            calibration["memory_footprint_gb"] = round(float(footprint), 2)
+            calibration["memory_source"] = "system trace" if trace.get("hbm_used_gb") else "neuron-monitor"
+        sim.calibration = {k: calibration[k] for k in ("prefill_scale", "decode_scale", "spill_fraction", "prefill_overhead_ms",
+                                                       "decode_overhead_ms", "collective_share", "baseline_compute_link_bw",
+                                                       "memory_footprint_gb")}
         # Reshape the measured workload for the scenario (e.g. 4x longer prompts).
         calibration["measured_prompt_tokens"] = calibration["prompt_tokens"]
         calibration["measured_generation_tokens"] = calibration["generation_tokens"]
@@ -508,8 +533,8 @@ class CampaignOrchestrator:
         # runs at the scenario's load (0.8 by default): requests queue inside each
         # burst, so p99 TTFT scales smoothly with service time instead of sitting on
         # an overload cliff. Loads above 1 model a saturated, throughput-bound chip.
-        service_ms = (modeled_prefill * calibration["prefill_scale"]
-                      + calibration["generation_tokens"] * modeled_decode * calibration["decode_scale"])
+        service_ms = (calibration["prefill_overhead_ms"] + modeled_prefill * calibration["prefill_scale"]
+                      + calibration["generation_tokens"] * (calibration["decode_overhead_ms"] + modeled_decode * calibration["decode_scale"]))
         burst = max(1, int(vllm.get("concurrency") or 4))
         interval = round(burst * service_ms / max(float(workload["load"]), 0.05), 3)
         mix = (0.5, 1.0, 1.5, 1.0, 0.75, 1.25)
