@@ -204,11 +204,17 @@ class CampaignOrchestrator:
                          f"(peak {f(neuron.get('core_utilization_peak_pct'))}%), {f(neuron.get('effective_tflops'), 1)} effective TFLOPS, "
                          f"{f(neuron.get('device_memory_gb'), 1)} GB device memory in use.")
         if system.get("available"):
+            line = (f"Neuron Explorer system trace (measured during traffic): NeuronCores busy {f(system.get('device_busy_pct'))}% "
+                    f"of the time, so serving is {'device-bound and faster hardware cuts latency directly' if (system.get('device_busy_pct') or 0) > 80 else 'partly host-bound'}; "
+                    f"on-device prefill {f(system.get('prefill_step_ms'))} ms and decode step {f(system.get('decode_step_ms'), 1)} ms; "
+                    f"collectives take {f(system.get('collective_pct'), 1)}% of execution"
+                    f"{' (the chip interconnect is not the bottleneck)' if (system.get('collective_pct') or 100) < 5 else ''}; "
+                    f"host copies {f(system.get('host_copy_pct'), 1)}%; {f(system.get('hbm_used_gb'), 1)} GB of HBM in use.")
             ai, ridge = system.get("arithmetic_intensity"), system.get("ridge_point")
-            bound = "memory-bound" if ai is not None and ridge is not None and ai < ridge else "compute-bound"
-            lines.append(f"Neuron Explorer system trace (measured): arithmetic intensity {f(ai, 1)} FLOP/B vs ridge {f(ridge)} → {bound}; "
-                         f"HBM bandwidth utilization {f(system.get('mbu_pct'))}%, DMA active {f(system.get('dma_active_pct'))}%, "
-                         f"SRAM spills are {f((system.get('spill_fraction') or 0) * 100)}% of HBM traffic.")
+            if ai is not None and ridge is not None:
+                line += (f" Device profile: arithmetic intensity {f(ai, 1)} FLOP/B vs ridge {f(ridge)} → "
+                         f"{'memory' if ai < ridge else 'compute'}-bound; HBM bandwidth utilization {f(system.get('mbu_pct'))}%.")
+            lines.append(line)
         if base.get("prefill_bound"):
             lines.append(f"Simulator on the baseline: prefill is {base['prefill_bound']}-bound, decode is {base['decode_bound']}-bound.")
         return lines

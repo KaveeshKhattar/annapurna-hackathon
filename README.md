@@ -91,13 +91,26 @@ live vLLM server and measuring it three ways:
 | --- | --- |
 | vLLM Prometheus `/metrics` (before/after deltas) | TTFT p50/p99, queue, prefill, per-output-token time, prompt and output tokens per request, KV-cache peak, model weight size |
 | `neuron-monitor` (1 s samples during the replay) | NeuronCore utilization, device memory in use |
-| Neuron Explorer system trace (`neuron-explorer view --output-format summary-json`) | arithmetic intensity vs. ridge point, HBM bandwidth utilization, DMA active time, SRAM spill share |
+| Neuron Explorer system trace (`neuron-explorer view --output-format json`) | over the traffic window: NeuronCore busy %, on-device prefill and decode-step time, share of execution in collectives and host copies, HBM in use |
 
-vllm-neuron does not populate its FLOPs/bytes counters, so arithmetic intensity
-comes from the system trace. To capture one, start vLLM with
-`NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_OUTPUT_DIR=/workspace/neuron-trace`
-(or set `ACCELTWIN_NEURON_TRACE_DIR`). Missing sources are shown as such and the
-simulator falls back to defaults for them.
+vllm-neuron writes the runtime profile only when its workers shut down, so a
+trace is a one-off capture (it is summarized once, then cached next to it):
+
+```bash
+/workspace/serve.sh --stop
+VLLM_NEURON_WORKER_TERMINATION_TIMEOUT=60 NEURON_RT_INSPECT_ENABLE=1 \
+NEURON_RT_INSPECT_OUTPUT_DIR=/workspace/neuron-trace \
+MODEL=unsloth/gpt-oss-20b-BF16 TP=4 MAX_MODEL_LEN=8192 /workspace/serve.sh
+# send some traffic (or start one design run), then flush the profile:
+/workspace/serve.sh --stop
+MODEL=unsloth/gpt-oss-20b-BF16 TP=4 MAX_MODEL_LEN=8192 /workspace/serve.sh   # back to normal
+```
+
+This captures the system profile only. Arithmetic intensity and HBM bandwidth
+utilization need device profiles; if those are present they are read too.
+vllm-neuron does not populate its FLOPs/bytes counters, so without them the
+compute- vs memory-bound split comes from the calibrated simulator. Missing
+sources are shown as such.
 
 The measurements calibrate the simulator (prefill and decode time scales, model
 size, spill share) and shape the evaluation workload: 32 requests in bursts at

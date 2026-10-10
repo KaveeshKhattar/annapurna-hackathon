@@ -340,35 +340,114 @@ def _loads_any(text: str) -> Any:
     return None
 
 
-def read_system_trace(trace_dir: Optional[str] = None, timeout: float = 180.0) -> Dict[str, Any]:
-    """Summarize a Neuron Explorer capture (NEURON_RT_INSPECT_OUTPUT_DIR), caching the result."""
+def summarize_system_profile(data: Dict[str, Any], gap_s: float = 5.0) -> Dict[str, Any]:
+    """Where device time went during the traffic in a Neuron runtime system profile.
+
+    Only the last burst of executions is used (startup warm-up is separated from
+    the traffic by an idle gap), so the numbers describe serving, not loading.
+    """
+    events = data.get("trace_event") or []
+    execs = [e for e in events if e.get("name") == "nc_exec_running" and e.get("duration")]
+    if not execs:
+        return {"available": False, "reason": "the system profile has no NeuronCore executions"}
+    spans = sorted((int(e["timestamp"]), int(e["timestamp"]) + int(e["duration"])) for e in execs)
+    window_start, window_end, last_end = spans[0][0], spans[0][1], spans[0][1]
+    for start, end in spans[1:]:
+        if start - last_end > gap_s * 1e9:
+            window_start = start
+        last_end = max(last_end, end)
+        window_end = last_end
+    inside = lambda e: window_start <= int(e.get("timestamp", 0)) <= window_end
+    window = [e for e in execs if inside(e)]
+
+    def total(name: str) -> float:
+        return sum(float(e.get("duration") or 0) for e in events if e.get("name") == name and inside(e))
+
+    busy: Dict[Any, List[tuple]] = {}
+    for e in window:
+        busy.setdefault((e.get("process_id"), e.get("device_core_idx", e.get("nc_idx"))), []).append(
+            (int(e["timestamp"]), int(e["timestamp"]) + int(e["duration"])))
+    length = max(window_end - window_start, 1)
+    fractions = []
+    for intervals in busy.values():
+        merged, cursor = 0, None
+        for start, end in sorted(intervals):
+            if cursor is None or start > cursor:
+                merged += end - start
+                cursor = end
+            elif end > cursor:
+                merged += end - cursor
+                cursor = end
+        fractions.append(merged / length)
+    # Decode steps dominate the count, so the median execution is a decode step;
+    # executions far longer than that are context encoding (prefill).
+    durations = sorted(float(e["duration"]) / 1e6 for e in window)
+    decode_ms = durations[len(durations) // 2]
+    long_runs = [d for d in durations if d > 3 * decode_ms]
+    prefill_ms = sum(long_runs) / len(long_runs) if long_runs else None
+    exec_ns = sum(float(e["duration"]) for e in window)
+    per_hbm: Dict[str, Dict[str, float]] = {}
+    for m in data.get("device_mem_usage") or []:
+        row = per_hbm.setdefault(str(m.get("hbm_idx")), {"total": 0.0, "spill": 0.0})
+        row["total"] = max(row["total"], float(m.get("total_bytes") or 0))
+        row["spill"] = max(row["spill"], float(m.get("dram_spill_bytes") or 0) + float(m.get("dma_rings_spill_bytes") or 0))
+    return {
+        "available": True,
+        "kind": "system profile",
+        "window_s": length / 1e9,
+        "executions_per_core": round(len(window) / max(len(busy), 1)),
+        "device_busy_pct": 100.0 * sum(fractions) / len(fractions),
+        "decode_step_ms": decode_ms,
+        "prefill_step_ms": prefill_ms,
+        "collective_pct": 100.0 * total("cc_running") / exec_ns if exec_ns else None,
+        "host_copy_pct": 100.0 * (total("dmem_buf_copyin") + total("dmem_buf_copyout")) / exec_ns if exec_ns else None,
+        "host_overhead_us": (total("nrt_model_submit") + total("nrta_execute_schedule")) / max(len(window), 1) / 1000.0,
+        "hbm_used_gb": sum(r["total"] for r in per_hbm.values()) / 1e9 or None,
+        "spill_mb": sum(r["spill"] for r in per_hbm.values()) / 1e6,
+    }
+
+
+def read_system_trace(trace_dir: Optional[str] = None, timeout: float = 900.0) -> Dict[str, Any]:
+    """Summarize a Neuron Explorer capture (NEURON_RT_INSPECT_OUTPUT_DIR), caching the result.
+
+    vllm-neuron writes the profile when its workers shut down, so a capture is:
+    start vLLM with inspection on, send traffic, stop vLLM, then read it here.
+    """
     directory = Path(trace_dir or os.getenv("ACCELTWIN_NEURON_TRACE_DIR", "/workspace/neuron-trace"))
-    if not directory.is_dir() or not any(directory.iterdir()):
-        return {"available": False, "reason": f"no capture in {directory}",
-                "hint": f"start vLLM with NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_OUTPUT_DIR={directory}"}
+    hint = (f"start vLLM with VLLM_NEURON_WORKER_TERMINATION_TIMEOUT=60 NEURON_RT_INSPECT_ENABLE=1 "
+            f"NEURON_RT_INSPECT_OUTPUT_DIR={directory}, send traffic, then stop it so the profile is written")
+    files = [p for p in directory.rglob("*") if p.is_file() and not p.name.startswith(".acceltwin")] if directory.is_dir() else []
+    if not files:
+        return {"available": False, "reason": f"no capture in {directory}", "hint": hint}
     cache = directory / ".acceltwin-summary.json"
-    newest = max((p.stat().st_mtime for p in directory.rglob("*") if p.is_file() and p != cache), default=0)
-    if cache.exists() and cache.stat().st_mtime >= newest:
+    if cache.exists() and cache.stat().st_mtime >= max(p.stat().st_mtime for p in files):
         try:
             return json.loads(cache.read_text())
         except ValueError:
             pass
     binary = _neuron_tool("neuron-explorer")
     if not binary:
-        return {"available": False, "reason": "neuron-explorer not installed"}
-    try:
-        done = subprocess.run([binary, "view", "-d", str(directory), "--output-format", "summary-json", "--disable-ui"],
-                              capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"available": False, "reason": f"neuron-explorer view failed: {exc}"}
-    payload = _loads_any(done.stdout)
-    if payload is None:
-        produced = sorted(directory.rglob("*summary*.json"), key=lambda p: p.stat().st_mtime)
-        payload = _loads_any(produced[-1].read_text()) if produced else None
-    if payload is None:
-        tail = (done.stderr or done.stdout).strip().splitlines()[-1:] or ["no output"]
-        return {"available": False, "reason": f"could not read trace summary: {tail[0][:160]}"}
-    summary = summarize_trace_json(payload)
+        return {"available": False, "reason": "neuron-explorer not installed", "hint": hint}
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="acceltwin-trace-") as work:
+        try:
+            # The json export writes system_profile.json (and device profiles, if captured) into the cwd.
+            subprocess.run([binary, "view", "-d", str(directory), "--output-format", "json", "--disable-ui"],
+                           cwd=work, capture_output=True, text=True, timeout=timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"available": False, "reason": f"neuron-explorer view failed: {exc}", "hint": hint}
+        system_file = Path(work) / "system_profile.json"
+        if not system_file.exists():
+            return {"available": False, "reason": "neuron-explorer produced no system profile", "hint": hint}
+        with system_file.open() as handle:
+            summary = summarize_system_profile(json.load(handle))
+        device = [summarize_trace_json(_loads_any(p.read_text())) for p in Path(work).glob("*.json")
+                  if p.name != "system_profile.json" and p.stat().st_size < 200_000_000]
+        device = [d for d in device if d.get("available")]
+        if device:
+            summary.update({k: v for k, v in device[0].items() if k not in {"available", "profiles"}})
+            summary["kind"] = "system + device profile"
     summary["source_dir"] = str(directory)
     try:
         cache.write_text(json.dumps(summary))
