@@ -174,7 +174,7 @@ sequenceDiagram
     O->>M: floorplan: assign blocks to die regions
     M-->>O: regions (checked, one repair with exact errors)
     O->>M: wiring: links + bandwidths
-    M-->>O: links (max-flow checked; repaired or widened)
+    M-->>O: links (max-flow checked, then repaired or widened)
     O->>C: simulate on the calibrated workload
     C-->>O: score, 6 gates, diagnosis with absolute targets
     O->>M: next round starts from the best design + this feedback
