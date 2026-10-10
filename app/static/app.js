@@ -23,7 +23,7 @@ const BLOCK_STYLE = {
   io: ['#f1f2f4', '#8a9099', 'I/O'],
 };
 
-const state = { campaignId: null, rendered: new Set(), timer: null, baseline: null };
+const state = { campaignId: null, rendered: new Set(), timer: null, baseline: null, entries: new Map(), selected: null };
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------- DOM helpers
@@ -162,13 +162,14 @@ function resultsBlock(metrics, baseMetrics, gates) {
     failed.length ? el('p', { class: 'note fail' }, 'Rejected: ' + failed.join(', ')) : null);
 }
 
-function card(attempt, { isBaseline = false, label } = {}) {
+function card(attempt, { isBaseline = false, label, withDiagram = true } = {}) {
   const v = verdict(attempt, isBaseline);
   const changes = isBaseline ? ['Trainium2-like reference: 4 compute clusters, 2 HBM stacks, 96 GB at 2.9 TB/s.']
     : (attempt.changes && attempt.changes.length ? attempt.changes : [attempt.rationale || attempt.feedback || 'No description.']);
   const deltas = attempt.deltas || [];
-  const node = el('article', { class: `iteration${!isBaseline && v.cls === 'fail' ? ' rejected' : ''}`, 'data-id': attempt.id || 'baseline' },
-    el('figure', { class: 'diagram', style: 'margin:0' }, attempt.design ? drawDiagram(attempt.design, attempt.changed_ids) : null),
+  const showDiagram = withDiagram && attempt.design;
+  const node = el('article', { class: `iteration${showDiagram ? '' : ' no-diagram'}${!isBaseline && v.cls === 'fail' ? ' rejected' : ''}` },
+    showDiagram ? el('figure', { class: 'diagram', style: 'margin:0' }, drawDiagram(attempt.design, attempt.changed_ids)) : null,
     el('div', { class: 'details' },
       el('header', {}, el('span', { class: 'eyebrow' }, label || (isBaseline ? 'Baseline' : `Iteration ${attempt.round}`)),
         el('span', { class: `pill ${v.cls}` }, v.text)),
@@ -200,15 +201,57 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+// A tile is just the diagram plus a one-line caption; details open on click.
+function tileMark(attempt, isBaseline) {
+  const v = verdict(attempt, isBaseline);
+  if (isBaseline) return { text: 'Start', cls: '' };
+  if (v.cls === 'fail') return { text: v.text, cls: 'fail' };
+  return attempt.improved ? { text: 'New best', cls: 'pass' } : { text: 'Not faster', cls: '' };
+}
+
+function addTile(attempt, isBaseline = false) {
+  const id = isBaseline ? 'baseline' : attempt.id;
+  state.entries.set(id, { attempt, isBaseline });
+  const mark = tileMark(attempt, isBaseline);
+  const label = isBaseline ? 'Baseline' : `Iteration ${attempt.round}`;
+  const item = el('li', { class: `tile${!isBaseline && mark.cls === 'fail' ? ' rejected' : ''}`, 'data-id': id },
+    el('button', { type: 'button', 'aria-label': `${label}: show details` },
+      attempt.design ? drawDiagram(attempt.design, attempt.changed_ids)
+        : el('div', { class: 'empty' }, 'No design produced'),
+      el('div', { class: 'tile-caption' }, el('span', {}, label), el('span', { class: `mark ${mark.cls}` }, mark.text))));
+  item.querySelector('button').addEventListener('click', () => select(id));
+  $('iterations').append(item);
+}
+
+function select(id) {
+  const detail = $('detail');
+  const same = state.selected === id;
+  state.selected = same ? null : id;
+  for (const tile of document.querySelectorAll('.tile')) {
+    tile.setAttribute('aria-current', String(tile.dataset.id === state.selected));
+  }
+  if (same) {
+    detail.hidden = true;
+    return;
+  }
+  const { attempt, isBaseline } = state.entries.get(id);
+  detail.replaceChildren(card(attempt, { isBaseline, withDiagram: false }));
+  detail.hidden = false;
+  detail.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 async function start(event) {
   event.preventDefault();
   clearTimeout(state.timer);
   state.rendered.clear();
+  state.entries.clear();
+  state.selected = null;
   $('iterations').replaceChildren();
+  $('detail').hidden = true;
   $('final').hidden = true;
   $('timeline').hidden = true;
   $('start').disabled = true;
-  setStatus('Measuring the baseline');
+  setStatus('Checking the model and measuring the baseline');
   try {
     const campaign = await api('/api/campaigns', {
       method: 'POST',
@@ -217,8 +260,7 @@ async function start(event) {
     state.campaignId = campaign.id;
     state.baseline = campaign.baseline_metrics;
     $('timeline').hidden = false;
-    $('iterations').append(card({ id: 'baseline', name: 'Baseline', design: campaign.baseline_design,
-      metrics: campaign.baseline_metrics }, { isBaseline: true }));
+    addTile({ name: 'Baseline', design: campaign.baseline_design, metrics: campaign.baseline_metrics }, true);
     poll();
   } catch (error) {
     setStatus(`Could not start: ${error.message}`, 'error');
@@ -238,7 +280,7 @@ async function poll() {
   for (const attempt of campaign.attempts || []) {
     if (state.rendered.has(attempt.id)) continue;
     state.rendered.add(attempt.id);
-    $('iterations').append(card(attempt));
+    addTile(attempt);
   }
   if (campaign.status === 'completed') return finish(campaign);
   if (campaign.status === 'failed') {
@@ -255,26 +297,33 @@ function finish(campaign) {
   $('start').disabled = false;
   setStatus('');
   const best = campaign.best_attempt;
-  const winnerId = best ? best.id : 'baseline';
-  const winnerCard = document.querySelector(`.iteration[data-id="${CSS.escape(winnerId)}"]`);
-  if (winnerCard) winnerCard.classList.add('winner');
+  const winnerTile = document.querySelector(`.tile[data-id="${CSS.escape(best ? best.id : 'baseline')}"]`);
+  if (winnerTile) {
+    winnerTile.classList.add('winner');
+    const mark = winnerTile.querySelector('.mark');
+    mark.className = 'mark best';
+    mark.textContent = 'Winner';
+  }
 
   const report = el('a', { href: `/api/reports/${encodeURIComponent(campaign.id)}`, download: 'chip-design-report.md' }, 'Download report');
+  let winner;
   if (best && best.metrics) {
     const change = pctChange(best.metrics.ttft_p99_ms, state.baseline.ttft_p99_ms);
     $('final-summary').replaceChildren(
       `Iteration ${best.round} wins: p99 time to first token ${fmtMs(state.baseline.ttft_p99_ms)} → ${fmtMs(best.metrics.ttft_p99_ms)}`
       + (change === null ? '' : ` (${change > 0 ? '+' : '−'}${Math.abs(change).toFixed(1)}%)`)
       + ', within budget and without losing throughput.', report);
-    $('final-card').replaceChildren(card(best, { label: `Iteration ${best.round} · Final` }));
+    winner = card(best, { label: `Iteration ${best.round}` });
   } else {
     $('final-summary').replaceChildren('No iteration beat the baseline within budget, so the baseline stays the best design.', report);
-    $('final-card').replaceChildren(card({ id: 'baseline', name: 'Baseline', design: campaign.baseline_design,
-      metrics: campaign.baseline_metrics }, { isBaseline: true, label: 'Baseline · Final' }));
+    winner = card({ name: 'Baseline', design: campaign.baseline_design, metrics: campaign.baseline_metrics },
+      { isBaseline: true });
   }
-  $('final-card').firstChild.classList.add('winner');
-  $('final-card').firstChild.querySelector('.pill').className = 'pill best';
-  $('final-card').firstChild.querySelector('.pill').textContent = 'Winner';
+  winner.classList.add('winner');
+  const pill = winner.querySelector('.pill');
+  pill.className = 'pill best';
+  pill.textContent = 'Winner';
+  $('final-card').replaceChildren(winner);
   $('final').hidden = false;
   $('final').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
@@ -283,7 +332,12 @@ async function loadConfig() {
   try {
     const config = await api('/api/config');
     const name = String(config.model || 'model').replace(/^openai\//, '');
-    $('model-label').textContent = config.mode === 'mock' ? `${name} · offline mode` : name;
+    $('model-label').textContent = config.mode === 'mock' ? `${name} · offline mode`
+      : config.ready ? name : `${name} · not reachable`;
+    if (config.mode !== 'mock' && !config.ready) {
+      $('model-label').style.color = 'var(--bad)';
+      setStatus(config.error, 'error');
+    }
   } catch (_) { /* label keeps its default */ }
 }
 

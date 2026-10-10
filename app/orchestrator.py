@@ -11,7 +11,7 @@ import time
 import uuid
 from typing import Any
 
-from .llm_client import LLMClient, ProposalError
+from .llm_client import LLMClient, ModelUnavailableError, ProposalError
 from .report import render_campaign_report
 
 
@@ -263,6 +263,11 @@ class CampaignOrchestrator:
         return record
 
     async def create_campaign(self, request: dict[str, Any]) -> dict[str, Any]:
+        check = getattr(self.proposer, "check", None)
+        if callable(check):
+            status = await asyncio.to_thread(check)
+            if not status.get("ready", True):
+                raise ModelUnavailableError(status.get("error") or "the model is not available")
         baseline_id = request.get("baseline_id")
         baseline = self.get_baseline(baseline_id) if baseline_id else None
         if baseline_id and baseline is None:
@@ -355,6 +360,11 @@ class CampaignOrchestrator:
                 try:
                     raw = await asyncio.to_thread(self.proposer.design_round, context)
                     design = self._build_design(self._extract_design(raw))
+                except ModelUnavailableError as exc:
+                    campaign["status"] = "failed"
+                    campaign["error"] = f"Model unavailable: {exc}"
+                    self._emit(campaign, "campaign.failed", {"error": campaign["error"]})
+                    return
                 except Exception as exc:
                     attempt = {"id": str(uuid.uuid4()), "round": round_no, "name": "Proposal failed",
                                "accepted": False, "feedback": f"The model could not produce a design: {exc}"}

@@ -116,3 +116,42 @@ def test_campaign_uses_staged_designer_and_records_changes():
     assert "Compute clusters 4 → 6" in attempt["deltas"]
     assert "compute-5" in attempt["changed_ids"]
     assert "request_outcomes" not in attempt["metrics"]
+
+
+def test_unserved_model_blocks_the_run_instead_of_faking_iterations():
+    class WrongModel(LLMClient):
+        def check(self):
+            return {"ready": False, "served": ["Qwen/Qwen3-8B"],
+                    "error": "openai/gpt-oss-20b is not being served; the server has Qwen/Qwen3-8B."}
+
+    api.orchestrator = CampaignOrchestrator(proposer=WrongModel(mode="auto"))
+    with TestClient(api.app) as client:
+        config = client.get("/api/config").json()
+        assert config["ready"] is False
+        response = client.post("/api/campaigns", json={"max_rounds": 2})
+    assert response.status_code == 503
+    assert "Qwen/Qwen3-8B" in response.json()["detail"]
+
+
+def test_model_dropping_mid_run_fails_the_campaign_loudly():
+    from app.llm_client import ModelUnavailableError
+
+    class DropsOut:
+        mode = "auto"
+        model = "openai/gpt-oss-20b"
+
+        def design_round(self, context):
+            raise ModelUnavailableError("openai/gpt-oss-20b did not answer within 240 s")
+
+    api.orchestrator = CampaignOrchestrator(proposer=DropsOut())
+    with TestClient(api.app) as client:
+        campaign_id = client.post("/api/campaigns", json={"max_rounds": 3}).json()["id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            campaign = client.get(f"/api/campaigns/{campaign_id}?compact=1").json()
+            if campaign["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.02)
+    assert campaign["status"] == "failed"
+    assert "did not answer" in campaign["error"]
+    assert campaign["attempts"] == []

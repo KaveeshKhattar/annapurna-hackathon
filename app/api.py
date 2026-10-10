@@ -46,7 +46,10 @@ async def health() -> dict[str, str]:
 @app.get("/api/config")
 async def config() -> dict[str, Any]:
     proposer = orchestrator.proposer
-    return {"model": getattr(proposer, "model", None), "mode": getattr(proposer, "mode", "custom")}
+    check = getattr(proposer, "check", None)
+    status = await asyncio.to_thread(check) if callable(check) else {"ready": True, "error": None}
+    return {"model": getattr(proposer, "model", None), "mode": getattr(proposer, "mode", "custom"),
+            "ready": status.get("ready", True), "error": status.get("error")}
 
 
 _HEAVY_METRICS = {"request_outcomes", "thermal_grid", "component_metrics", "component_temperatures"}

@@ -17,6 +17,10 @@ class ProposalError(ValueError):
     """The proposer did not return a valid structured design."""
 
 
+class ModelUnavailableError(RuntimeError):
+    """The configured model server cannot be reached or does not serve the model."""
+
+
 class ModelDiscoveryError(ProposalError):
     """The OpenAI-compatible endpoint has no discoverable served model."""
 
@@ -50,13 +54,33 @@ class LLMClient:
             return self._rule_proposal(context)
         from .agent import ChipDesignAgent
 
+        # No silent offline fallback here: a design round either comes from the
+        # model or fails loudly, so the UI never passes scripted edits off as AI.
         try:
             return ChipDesignAgent(self.chat_json, report=context.get("report"),
                                    max_tokens=self.max_tokens).run(context)
-        except (httpx.HTTPError, ModelDiscoveryError):
-            if self.mode in {"openai", "remote", "strict"}:
-                raise
-            return self._rule_proposal(context)
+        except httpx.TimeoutException as exc:
+            raise ModelUnavailableError(f"{self.model} did not answer within {self.timeout:g} s") from exc
+        except httpx.HTTPError as exc:
+            raise ModelUnavailableError(f"{self.model} at {self.base_url} failed: {exc}") from exc
+
+    def check(self) -> dict[str, Any]:
+        """Report whether the configured model is actually being served."""
+        if self.mode in {"mock", "rule", "rules", "offline"}:
+            return {"ready": True, "served": [], "error": None}
+        try:
+            response = httpx.get(f"{self.base_url}/models", headers={"Authorization": f"Bearer {self.api_key}"},
+                                 timeout=5.0)
+            response.raise_for_status()
+            served = [item.get("id") for item in response.json().get("data", []) if isinstance(item, dict)]
+        except (httpx.HTTPError, ValueError) as exc:
+            return {"ready": False, "served": [],
+                    "error": f"No model server at {self.base_url} ({exc.__class__.__name__}). Is serve.sh running?"}
+        if self.model not in served:
+            return {"ready": False, "served": served,
+                    "error": f"{self.model} is not being served; the server has {', '.join(map(str, served)) or 'no models'}. "
+                             f"Restart serve.sh with MODEL={self.model}, or set ACCELTWIN_LLM_MODEL."}
+        return {"ready": True, "served": served, "error": None}
 
     def chat_json(self, system: str, user: str, max_tokens: int | None = None) -> dict[str, Any]:
         """Send one chat turn and parse the single JSON object it returns."""

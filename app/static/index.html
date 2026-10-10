@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <meta name="description" content="An agent that designs accelerator chips and tests each iteration in simulation.">
   <title>Chip Builder</title>
-  <link rel="stylesheet" href="/static/styles.css?v=3.0.0">
-  <script src="/static/app.js?v=3.0.0" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=3.1.0">
+  <script src="/static/app.js?v=3.1.0" defer></script>
 </head>
 <body>
   <main class="page">
@@ -44,7 +44,9 @@
           <li><span class="swatch changed"></span>Changed</li>
         </ul>
       </div>
-      <div id="iterations"></div>
+      <p class="explainer">Each iteration, the model modifies the best chip so far, the simulator tests it, and the result feeds the next attempt. Click a diagram for details.</p>
+      <ol class="tiles" id="iterations"></ol>
+      <div class="detail" id="detail" hidden></div>
     </section>
   </main>
 </body>
