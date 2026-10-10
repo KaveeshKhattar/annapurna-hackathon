@@ -311,7 +311,7 @@ function source(title, data, rows, captureHint) {
   return el('div', { class: 'source' },
     el('div', { class: 'source-head' }, el('span', {}, title), el('span', { class: `tag ${ok ? 'measured' : 'missing'}` }, ok ? 'measured' : 'not available')),
     ok ? kv(rows) : el('p', { class: 'missing-note' }, (data && data.reason) || 'Not collected.',
-      captureHint ? ['. To capture it, start vLLM with ', el('code', {}, captureHint), '.'] : null));
+      captureHint ? ['. To capture one: ', el('code', {}, captureHint), '.'] : null));
 }
 
 function renderChecker(campaign) {
@@ -337,12 +337,14 @@ function renderChecker(campaign) {
       ['Device', `${n.device_type || '—'} · ${n.cores || '—'} cores`],
     ]),
     source('Neuron Explorer system trace', s, [
-      ['Arithmetic intensity', `${fmt(s.arithmetic_intensity, 1)} FLOP/B`],
-      ['Ridge point', `${fmt(s.ridge_point)} FLOP/B`],
-      ['HBM bandwidth used (MBU)', `${fmt(s.mbu_pct)}%`],
-      ['DMA active', `${fmt(s.dma_active_pct)}%`],
-      ['SRAM spill share', `${fmt((s.spill_fraction || 0) * 100, 1)}%`],
-    ], 'NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_OUTPUT_DIR=/workspace/neuron-trace'));
+      ['NeuronCores busy (traffic)', `${fmt(s.device_busy_pct, 1)}%`],
+      ['Prefill on device', fmtMs(s.prefill_step_ms)],
+      ['Decode step on device', fmtMs(s.decode_step_ms)],
+      ['Collectives / host copies', `${fmt(s.collective_pct, 1)}% / ${fmt(s.host_copy_pct, 1)}% of exec`],
+      ['HBM in use', `${fmt(s.hbm_used_gb, 1)} GB`],
+      num(s.arithmetic_intensity) !== null ? ['Arithmetic intensity', `${fmt(s.arithmetic_intensity, 1)} / ${fmt(s.ridge_point)} FLOP/B`] : null,
+      num(s.mbu_pct) !== null ? ['HBM bandwidth used (MBU)', `${fmt(s.mbu_pct)}%`] : null,
+    ], s.hint));
 
   const live = cal.live;
   const calibrated = el('div', { class: 'card checker-col', style: '--i:1' },

@@ -3,7 +3,8 @@ from __future__ import annotations
 from app.models import HardwareDesign
 from app.orchestrator import CampaignOrchestrator
 from app.simulator import DigitalTwinSimulator
-from app.telemetry import hist_quantile, scrape_prometheus, summarize_trace_json, summarize_vllm
+from app.telemetry import (hist_quantile, scrape_prometheus, summarize_system_profile, summarize_trace_json,
+                           summarize_vllm)
 
 M = 'model_name="gpt-oss"'
 
@@ -91,3 +92,26 @@ def test_area_feedback_gives_absolute_targets_not_relative_steps():
     text = CampaignOrchestrator._feedback(gates, {"area_mm2": 654}, 90, 50, design=design,
                                           constraints={"max_area_mm2": 650})
     assert "compute_cores <= 7" in text and "hbm_gb <= 93" in text
+
+
+def test_system_profile_reports_traffic_window_not_warmup():
+    ms = 1_000_000
+    events = [{"name": "nc_exec_running", "timestamp": i * 50 * ms, "duration": 500 * ms, "process_id": "1",
+               "device_core_idx": 0} for i in range(3)]                       # warm-up, long before traffic
+    t = 60_000 * ms
+    for i in range(2):                                                         # two prefills...
+        events.append({"name": "nc_exec_running", "timestamp": t, "duration": 240 * ms, "process_id": "1", "device_core_idx": 0})
+        t += 240 * ms
+    for i in range(20):                                                        # ...then decode steps with a 4 ms host gap
+        events.append({"name": "nc_exec_running", "timestamp": t, "duration": 36 * ms, "process_id": "1", "device_core_idx": 0})
+        events.append({"name": "cc_running", "timestamp": t + ms, "duration": ms // 2, "process_id": "1"})
+        t += 40 * ms
+    data = {"trace_event": events, "device_mem_usage": [
+        {"hbm_idx": "0", "total_bytes": 12e9, "dram_spill_bytes": 0, "dma_rings_spill_bytes": 5e6},
+        {"hbm_idx": "1", "total_bytes": 12.5e9, "dram_spill_bytes": 0, "dma_rings_spill_bytes": 5e6}]}
+    summary = summarize_system_profile(data)
+    assert summary["available"] and summary["executions_per_core"] == 22
+    assert summary["decode_step_ms"] == 36.0 and summary["prefill_step_ms"] == 240.0
+    assert abs(summary["device_busy_pct"] - 100 * (2 * 240 + 20 * 36) / (2 * 240 + 19 * 40 + 36)) < 0.01
+    assert abs(summary["collective_pct"] - 100 * 10 / (2 * 240 + 20 * 36)) < 0.01
+    assert summary["hbm_used_gb"] == 24.5 and summary["spill_mb"] == 10.0
