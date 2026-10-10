@@ -4,7 +4,7 @@ One design round is split into short, focused model calls instead of asking
 for the whole component graph at once:
 
 1. plan        - pick architecture totals and explain the intended changes
-2. floorplan   - place the blocks that the plan implies
+2. floorplan   - assign each block to a die region (code computes exact boxes)
 3. interconnect - wire the placed blocks
 
 Code, not the model, derives per-block resources from the plan totals, so the
@@ -47,6 +47,7 @@ BOUNDS: dict[str, tuple[float, float, type]] = {
 }
 SCALARS = [key for key in BOUNDS if key not in {"compute_clusters", "hbm_stacks"}]
 MAX_DMA_BLOCKS = 4
+REGIONS = ("left", "right", "top", "bottom", "center")
 NOC_AREA_MM2 = 120.0
 MIN_GAP = 0.02
 
@@ -133,6 +134,7 @@ class ChipDesignAgent:
             f"- round {item.get('round')}: {item.get('name')} | changes: {'; '.join(item.get('changes') or []) or 'n/a'}"
             f" | {item.get('outcome')}" for item in history[-4:]) or "- none yet"
         bounds = ", ".join(f"{key} {lo:g}-{hi:g}" for key, (lo, hi, _kind) in BOUNDS.items())
+        signals = "\n".join(f"- {line}" for line in context.get("signals") or []) or "- no live measurements available"
         return f"""Design brief: {context.get('goal') or 'Minimize p99 time-to-first-token without reducing throughput.'}
 
 Workload: a {start.get('model_size_b', 13):g}B-parameter LLM with {start.get('weight_bytes_per_parameter', 2):g}-byte weights, served under a bursty request trace.
@@ -146,17 +148,20 @@ How the simulator behaves:
 - area ~= 42 mm2 per core + 1.45 mm2 per GB HBM + 0.65 mm2 per GB SRAM + 3.5 mm2 per DMA engine + 120 mm2 NoC
 - compute clusters placed close together or at the die centre run hotter
 
+Measured on the live Trainium chip and from the simulator:
+{signals}
+
 Current best design totals: {json.dumps(current)}
 Its simulated result: {self._metrics_line(best)}
-Last checker feedback: {context.get('feedback') or 'none'}
+Checker feedback on the last proposal (it may have been rejected; you are editing the current best design above, so read its numbers as absolute targets): {context.get('feedback') or 'none'}
 Earlier rounds:
 {history_lines}
 
 Allowed ranges: {bounds}. compute_clusters must not exceed compute_cores.
-Change one to three things that address the biggest bottleneck. Do not repeat a rejected idea.
+Change one to three things that address the biggest measured bottleneck, and say which measurement motivated it. Do not repeat a rejected idea.
 
 Return:
-{{"name": "<=6 word design name", "rationale": "one or two sentences on why", "changes": ["up to 4 short concrete changes"], "targets": {{{', '.join(f'"{key}": <number>' for key in BOUNDS)}}}}}"""
+{{"name": "<=6 word statement of the change, e.g. Widen HBM path", "rationale": "one sentence: the bottleneck you saw and why this fixes it", "changes": ["up to 4 short concrete changes"], "targets": {{{', '.join(f'"{key}": <number>' for key in BOUNDS)}}}}}"""
 
     def _parse_plan(self, raw: Any, current: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
@@ -208,84 +213,132 @@ Return:
         return blocks
 
     def _floorplan(self, blocks: list[dict[str, Any]], start: dict[str, Any], rationale: str) -> dict[str, list[float]]:
-        placeable = [block for block in blocks if block["type"] != "noc"]
-        total_area = sum(block["area_mm2"] for block in placeable) or 1.0
-        rows = []
-        for block in placeable:
-            side = math.sqrt(0.55 * block["area_mm2"] / total_area)
-            rows.append(f"- {block['id']} ({block['type']}), about {side:.2f} x {side:.2f}")
-        previous = {c.get("id"): [_round(float(c.get(k, 0)), 3) for k in ("x", "y", "width", "height")]
-                    for c in start.get("components") or [] if c.get("type") != "noc"}
-        prompt = f"""Place the blocks of an accelerator die. Coordinates are normalized 0..1 (x to the right, y downward). Each block is [x, y, width, height].
+        """The model assigns each block to a die region; code turns regions into exact boxes.
 
-Rules:
-- every block lies fully inside the die: x >= 0, y >= 0, x + width <= 1, y + height <= 1
-- blocks must not overlap; leave a gap of at least {MIN_GAP} between them
-- keep the suggested sizes roughly
-- put HBM stacks on the die edges next to the compute clusters they feed
-- spread compute clusters apart to avoid hotspots; keep SRAM next to compute; DMA near an edge
-- the interconnect (noc-0) is drawn automatically underneath; do not place it
+        Small models are unreliable at raw coordinates, but good at "HBM on the
+        left and top edges, compute in the centre". Regions whose contents did not
+        change keep their previous boxes, so only real layout changes show up.
+        """
+        placeable = [block for block in blocks if block["type"] != "noc"]
+        previous = self._infer_regions(start)
+        rows = [f"- {block['id']} ({block['type']}), currently {previous.get(block['id'], 'new')}" for block in placeable]
+        prompt = f"""Assign each block of an accelerator die to a region: "left", "right", "top", "bottom" (the four die edges) or "center".
+Code converts regions into exact, non-overlapping coordinates; blocks in one region share it evenly.
+
+Physical rules:
+- HBM stacks must sit on a die edge (their PHYs are at the edge), never in the center
+- compute clusters go in the center; at least one block must be in the center
+- spreading HBM stacks over more edges shortens the wires to compute; crowding one edge makes each stack thinner
+- SRAM should border the compute it feeds; DMA engines sit on an edge near I/O
 
 Blocks:
 {chr(10).join(rows)}
 
-Previous placement, for reference: {json.dumps(previous)}
 Design intent: {rationale or 'n/a'}
+Keep a block where it is unless moving it serves the intent.
 
-Return: {{"placements": {{"<block id>": [x, y, width, height]}}}} listing every block above."""
-        ids = [block["id"] for block in placeable]
+Return: {{"regions": {{"<block id>": "left|right|top|bottom|center"}}}} listing every block above."""
+        ids = {block["id"]: block["type"] for block in placeable}
         errors: list[str] = []
         for attempt in range(2):
             text = prompt if not errors else (
-                prompt + "\n\nYour previous placement was rejected:\n- " + "\n- ".join(errors[:8])
-                + "\nFix these problems and return the full placement again.")
+                prompt + "\n\nYour previous answer was rejected:\n- " + "\n- ".join(errors[:8])
+                + "\nFix these problems and return every block again.")
             try:
                 raw = self.chat(SYSTEM, text, self.max_tokens)
             except ProposalError as exc:
                 errors = [str(exc)]
                 continue
-            placements, errors = self._check_placements(raw, ids)
+            regions, errors = self._check_regions(raw, ids)
             if not errors:
                 self.steps.append("floorplan" if attempt == 0 else "floorplan (repaired)")
-                placements["noc-0"] = self._noc_box(placements)
-                return placements
+                return self._pack(placeable, regions, start, previous)
         self.steps.append("floorplan (automatic fallback: " + (errors[0] if errors else "no reply") + ")")
-        return self._fallback_layout(blocks)
+        regions = {block_id: previous.get(block_id) or self._default_region(kind) for block_id, kind in ids.items()}
+        return self._pack(placeable, regions, start, previous)
 
     @staticmethod
-    def _check_placements(raw: Any, ids: list[str]) -> tuple[dict[str, list[float]], list[str]]:
-        boxes = raw.get("placements") if isinstance(raw, dict) else None
-        if not isinstance(boxes, dict):
-            return {}, ['missing "placements" object']
-        placements: dict[str, list[float]] = {}
+    def _default_region(kind: str) -> str:
+        return {"hbm": "left", "sbuf": "top", "dma": "bottom"}.get(kind, "center")
+
+    @staticmethod
+    def _infer_regions(design: dict[str, Any]) -> dict[str, str]:
+        """Read the region of every block in an existing design from its centre point."""
+        regions = {}
+        for c in design.get("components") or []:
+            if c.get("type") == "noc":
+                continue
+            cx = float(c.get("x", 0)) + float(c.get("width", 0)) / 2
+            cy = float(c.get("y", 0)) + float(c.get("height", 0)) / 2
+            regions[c.get("id")] = ("left" if cx < 0.2 else "right" if cx > 0.8 else
+                                    "top" if cy < 0.17 else "bottom" if cy > 0.83 else "center")
+        return regions
+
+    @staticmethod
+    def _check_regions(raw: Any, ids: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+        regions = raw.get("regions") if isinstance(raw, dict) else None
+        if not isinstance(regions, dict):
+            return {}, ['missing "regions" object']
+        out: dict[str, str] = {}
         errors: list[str] = []
-        for block_id in ids:
-            box = boxes.get(block_id)
-            if isinstance(box, dict):
-                box = [box.get(k) for k in ("x", "y", "width", "height")]
-            values = [_num(v) for v in box] if isinstance(box, list) and len(box) == 4 else None
-            if not values or any(v is None for v in values):
-                errors.append(f"{block_id} needs [x, y, width, height]")
+        for block_id, kind in ids.items():
+            region = str(regions.get(block_id, "")).strip().lower()
+            if region not in REGIONS:
+                errors.append(f"{block_id} needs a region (one of {', '.join(REGIONS)})")
+            elif kind == "hbm" and region == "center":
+                errors.append(f"{block_id} is an HBM stack and must sit on a die edge")
+            else:
+                out[block_id] = region
+        if out and "center" not in out.values():
+            errors.append("at least one block (normally the compute clusters) must be in the center")
+        return out, errors
+
+    @classmethod
+    def _pack(cls, placeable: list[dict[str, Any]], regions: dict[str, str], start: dict[str, Any],
+              previous: dict[str, str]) -> dict[str, list[float]]:
+        """Deterministic, overlap-free coordinates for a region assignment."""
+        margin, side, edge, gap = 0.02, 0.16, 0.13, MIN_GAP
+        used = set(regions.values())
+        x0 = margin + side + gap if "left" in used else margin
+        x1 = 1 - margin - side - gap if "right" in used else 1 - margin
+        y0 = margin + edge + gap if "top" in used else margin
+        y1 = 1 - margin - edge - gap if "bottom" in used else 1 - margin
+        frames = {"left": (margin, y0, side, y1 - y0), "right": (1 - margin - side, y0, side, y1 - y0),
+                  "top": (x0, margin, x1 - x0, edge), "bottom": (x0, 1 - margin - edge, x1 - x0, edge),
+                  "center": (x0, y0, x1 - x0, y1 - y0)}
+        order = {"compute_cluster": 0, "hbm": 1, "sbuf": 2, "dma": 3}
+        old_boxes = {c.get("id"): [float(c.get(k, 0)) for k in ("x", "y", "width", "height")]
+                     for c in start.get("components") or []}
+        previous_used = set(previous.values())
+        boxes: dict[str, list[float]] = {}
+        for region, (fx, fy, fw, fh) in frames.items():
+            members = sorted((b["id"] for b in placeable if regions[b["id"]] == region),
+                             key=lambda i: (order.get(next(b["type"] for b in placeable if b["id"] == i), 9), i))
+            if not members:
                 continue
-            x, y, w, h = values
-            if w < 0.03 or h < 0.03:
-                errors.append(f"{block_id} is too small")
+            same = sorted(members) == sorted(k for k, v in previous.items() if v == region)
+            if same and previous_used == used and all(m in old_boxes for m in members):
+                for m in members:
+                    boxes[m] = [_round(v) for v in old_boxes[m]]
                 continue
-            # Forgive tiny overshoots by sliding the block back onto the die.
-            x = min(max(x, 0.0), 1.0 - w) if x + w <= 1.03 and x >= -0.03 else x
-            y = min(max(y, 0.0), 1.0 - h) if y + h <= 1.03 and y >= -0.03 else y
-            if x < 0 or y < 0 or x + w > 1 or y + h > 1 or w > 1 or h > 1:
-                errors.append(f"{block_id} extends outside the die")
-                continue
-            placements[block_id] = [_round(x), _round(y), _round(w), _round(h)]
-        keys = list(placements)
-        for i, a in enumerate(keys):
-            ax, ay, aw, ah = placements[a]
-            for b in keys[i + 1:]:
-                bx, by, bw, bh = placements[b]
-                if min(ax + aw, bx + bw) - max(ax, bx) > 0.01 and min(ay + ah, by + bh) - max(ay, by) > 0.01:
-                    errors.append(f"{a} overlaps {b}")
-        return placements, errors
+            n = len(members)
+            if region == "center":
+                cols = math.ceil(math.sqrt(n))
+                rows = math.ceil(n / cols)
+                cw, ch = (fw - gap * (cols - 1)) / cols, (fh - gap * (rows - 1)) / rows
+                for i, m in enumerate(members):
+                    r, c = divmod(i, cols)
+                    boxes[m] = [_round(fx + c * (cw + gap)), _round(fy + r * (ch + gap)), _round(cw), _round(ch)]
+            elif region in {"left", "right"}:
+                h = (fh - gap * (n - 1)) / n
+                for i, m in enumerate(members):
+                    boxes[m] = [_round(fx), _round(fy + i * (h + gap)), _round(fw), _round(h)]
+            else:
+                w = (fw - gap * (n - 1)) / n
+                for i, m in enumerate(members):
+                    boxes[m] = [_round(fx + i * (w + gap)), _round(fy), _round(w), _round(fh)]
+        boxes["noc-0"] = cls._noc_box(boxes)
+        return boxes
 
     @staticmethod
     def _noc_box(placements: dict[str, list[float]]) -> list[float]:
@@ -297,35 +350,15 @@ Return: {{"placements": {{"<block id>": [x, y, width, height]}}}} listing every 
         y1 = min(1.0, max(b[1] + b[3] for b in compute) + 0.02)
         return [_round(x0), _round(y0), _round(x1 - x0), _round(y1 - y0)]
 
-    @staticmethod
-    def _fallback_layout(blocks: list[dict[str, Any]]) -> dict[str, list[float]]:
-        """Deterministic, overlap-free layout: HBM on the sides, compute grid centre."""
-        placements: dict[str, list[float]] = {}
-        hbm = [b["id"] for b in blocks if b["type"] == "hbm"]
-        compute = [b["id"] for b in blocks if b["type"] == "compute_cluster"]
-        dma = [b["id"] for b in blocks if b["type"] == "dma"]
-        columns = [hbm[: math.ceil(len(hbm) / 2)], hbm[math.ceil(len(hbm) / 2):]]
-        for column, x in zip(columns, (0.03, 0.81)):
-            if not column:
-                continue
-            height = (0.64 - MIN_GAP * (len(column) - 1)) / len(column)
-            for i, block_id in enumerate(column):
-                placements[block_id] = [x, _round(0.18 + i * (height + MIN_GAP)), 0.16, _round(height)]
-        cols = math.ceil(math.sqrt(len(compute))) if compute else 1
-        rows = math.ceil(len(compute) / cols) if compute else 1
-        cell_w = (0.52 - MIN_GAP * (cols - 1)) / cols
-        cell_h = (0.60 - MIN_GAP * (rows - 1)) / rows
-        for i, block_id in enumerate(compute):
-            r, c = divmod(i, cols)
-            placements[block_id] = [_round(0.24 + c * (cell_w + MIN_GAP)), _round(0.20 + r * (cell_h + MIN_GAP)),
-                                    _round(cell_w), _round(cell_h)]
-        placements["sbuf-0"] = [0.24, 0.03, 0.52, 0.13]
-        if dma:
-            width = (0.52 - MIN_GAP * (len(dma) - 1)) / len(dma)
-            for i, block_id in enumerate(dma):
-                placements[block_id] = [_round(0.24 + i * (width + MIN_GAP)), 0.86, _round(width), 0.08]
-        placements["noc-0"] = [0.22, 0.17, 0.56, 0.66]
-        return placements
+    @classmethod
+    def _fallback_layout(cls, blocks: list[dict[str, Any]]) -> dict[str, list[float]]:
+        """Deterministic default layout: HBM split over the sides, compute grid in the centre."""
+        placeable = [b for b in blocks if b["type"] != "noc"]
+        hbm = [b["id"] for b in placeable if b["type"] == "hbm"]
+        regions = {b["id"]: cls._default_region(b["type"]) for b in placeable}
+        for i, block_id in enumerate(hbm):
+            regions[block_id] = "left" if i < math.ceil(len(hbm) / 2) else "right"
+        return cls._pack(placeable, regions, {}, {})
 
     # -------------------------------------------------------------- stage 3
 
@@ -346,7 +379,8 @@ Rules:
 - every compute cluster must reach at least one HBM stack, directly or through noc-0
 - connect sbuf-0 and every DMA block to noc-0 or to a compute cluster
 - each link is [source id, target id, bandwidth in TB/s] with bandwidth between 0.05 and {2 * bandwidth:g}
-- the simulator scores the max flow from HBM to compute, the average hop count, and wire length: short direct HBM-to-compute links help, but links wider than the HBM can feed add nothing
+- the links must be able to carry all {bandwidth:g} TB/s from the HBM stacks to the compute clusters (max flow), or the extra HBM bandwidth is wasted: give each HBM link its stack's bandwidth, and make the links into compute add up to at least {bandwidth:g} TB/s
+- the simulator also scores average hop count and wire length: short direct HBM-to-compute links help
 
 Previous links, for reference: {json.dumps(previous)}
 
@@ -364,6 +398,18 @@ Return: {{"links": [["hbm-0", "noc-0", 1.0], ...]}}"""
                 continue
             links, errors = self._check_links(raw, ids, bandwidth)
             if not errors:
+                flow = self._flow(start, totals, blocks, placements, links)
+                if flow < 0.9 * bandwidth:
+                    errors = [f"the links carry only {flow:.2f} of the {bandwidth:g} TB/s the HBM stacks provide to compute; "
+                              "widen the links on every HBM-to-compute path so each carries its share"]
+                    if attempt == 1:
+                        # Keep the model's topology but scale the links up to the HBM rate.
+                        factor = min(4.0, bandwidth / max(flow, 1e-6))
+                        links = [link.model_copy(update={"bandwidth_tb_s": _round(min(link.bandwidth_tb_s * factor, 2 * bandwidth))})
+                                 for link in links]
+                        self.steps.append("interconnect (links widened to the HBM rate)")
+                        return links
+                    continue
                 self.steps.append("interconnect" if attempt == 0 else "interconnect (repaired)")
                 return links
         self.steps.append("interconnect (automatic fallback: " + (errors[0] if errors else "no reply") + ")")
@@ -439,28 +485,37 @@ Return: {{"links": [["hbm-0", "noc-0", 1.0], ...]}}"""
 
     # ------------------------------------------------------------- assembly
 
+    @staticmethod
+    def _build(start: dict[str, Any], totals: dict[str, Any], blocks: list[dict[str, Any]],
+               boxes: dict[str, list[float]], edges: list[Connection]) -> HardwareDesign:
+        components = []
+        for block in blocks:
+            x, y, w, h = boxes[block["id"]]
+            components.append(Component(
+                id=block["id"], type=block["type"], label=block["label"], x=x, y=y, width=w, height=h,
+                layer=0 if block["type"] == "noc" else 1,
+                core_count=block.get("core_count", 0), compute_tflops=_round(block.get("compute_tflops", 0)),
+                capacity_gb=_round(block.get("capacity_gb", 0)), bandwidth_tb_s=_round(block.get("bandwidth_tb_s", 0)),
+                dma_engines=block.get("dma_engines", 0), area_mm2=_round(block["area_mm2"], 2)))
+        fields = {key: value for key, value in start.items() if key not in {"components", "connections", "name"}}
+        fields.update({key: totals[key] for key in SCALARS})
+        return HardwareDesign(**fields, components=components, connections=edges)
+
+    def _flow(self, start: dict[str, Any], totals: dict[str, Any], blocks: list[dict[str, Any]],
+              boxes: dict[str, list[float]], links: list[Connection]) -> float:
+        """Max flow from HBM to compute through the proposed links, in TB/s."""
+        from .simulator import DigitalTwinSimulator
+
+        return DigitalTwinSimulator(self._build(start, totals, blocks, boxes, links))._topology_profile()["flow"]
+
     def _assemble(self, start: dict[str, Any], totals: dict[str, Any], blocks: list[dict[str, Any]],
                   placements: dict[str, list[float]], links: list[Connection]) -> dict[str, Any]:
-        def build(boxes: dict[str, list[float]], edges: list[Connection]) -> HardwareDesign:
-            components = []
-            for block in blocks:
-                x, y, w, h = boxes[block["id"]]
-                components.append(Component(
-                    id=block["id"], type=block["type"], label=block["label"], x=x, y=y, width=w, height=h,
-                    layer=0 if block["type"] == "noc" else 1,
-                    core_count=block.get("core_count", 0), compute_tflops=_round(block.get("compute_tflops", 0)),
-                    capacity_gb=_round(block.get("capacity_gb", 0)), bandwidth_tb_s=_round(block.get("bandwidth_tb_s", 0)),
-                    dma_engines=block.get("dma_engines", 0), area_mm2=_round(block["area_mm2"], 2)))
-            fields = {key: value for key, value in start.items() if key not in {"components", "connections", "name"}}
-            fields.update({key: totals[key] for key in SCALARS})
-            return HardwareDesign(**fields, components=components, connections=edges)
-
-        design = build(placements, links)
+        design = self._build(start, totals, blocks, placements, links)
         errors = design.validate_topology()
         if errors:
             # The stage checks should make this unreachable; stay safe anyway.
             self.steps.append("assembly fallback: " + errors[0])
-            design = build(self._fallback_layout(blocks), self._fallback_links(blocks, totals))
+            design = self._build(start, totals, blocks, self._fallback_layout(blocks), self._fallback_links(blocks, totals))
         return design.model_dump(mode="json")
 
     # -------------------------------------------------------------- helpers

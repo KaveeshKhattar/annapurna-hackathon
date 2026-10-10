@@ -4,37 +4,65 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <meta name="description" content="An agent that designs accelerator chips and tests each iteration in simulation.">
+  <meta name="description" content="An agent that designs accelerator chips for a measured Trainium workload and checks every iteration in simulation.">
   <title>Chip Builder</title>
-  <link rel="stylesheet" href="/static/styles.css?v=3.1.0">
-  <script src="/static/app.js?v=3.1.0" defer></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css?v=4.0.0">
+  <script src="/static/app.js?v=4.0.0" defer></script>
 </head>
 <body>
-  <main class="page">
-    <header class="masthead">
-      <h1>Chip Builder</h1>
-      <p class="model" id="model-label">gpt-oss-20b</p>
-    </header>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span>Chip Builder</a>
+      <span class="badge model-badge" id="model-badge"><span class="dot"></span><span id="model-label">gpt-oss-20b</span></span>
+    </div>
+  </header>
 
-    <form class="brief" id="brief-form">
+  <main class="page">
+    <section class="hero">
+      <h1>Design a chip for the workload running on your Trainium.</h1>
+      <p class="lede">The agent measures the live model, proposes a modified chip, and a checker grades every attempt in a calibrated simulator. The grade and the reason feed the next attempt.</p>
+    </section>
+
+    <form class="card brief" id="brief-form">
       <label for="goal">Design brief</label>
       <textarea id="goal" rows="2">Minimize p99 time-to-first-token without reducing throughput.</textarea>
       <div class="brief-footer">
-        <p class="budget">Budget: 600 W · 85 °C · 650 mm² · up to 5 iterations</p>
-        <button type="submit" id="start">Design chip</button>
+        <ul class="budget" aria-label="Hard limits">
+          <li>Power ≤ 600 W</li><li>Temp ≤ 85 °C</li><li>Area ≤ 650 mm²</li><li>≤ 5 iterations</li>
+        </ul>
+        <button type="submit" class="btn" id="start">Design chip <span aria-hidden="true">→</span></button>
       </div>
     </form>
 
+    <ol class="pipeline" id="pipeline" hidden aria-label="Progress">
+      <li data-step="measure"><span class="step-dot"></span>Measure</li>
+      <li data-step="calibrate"><span class="step-dot"></span>Calibrate</li>
+      <li data-step="plan"><span class="step-dot"></span>Plan</li>
+      <li data-step="floorplan"><span class="step-dot"></span>Floorplan</li>
+      <li data-step="wire"><span class="step-dot"></span>Wire</li>
+      <li data-step="simulate"><span class="step-dot"></span>Simulate &amp; check</li>
+      <li data-step="done"><span class="step-dot"></span>Winner</li>
+    </ol>
     <p class="status" id="status" hidden></p>
 
-    <section class="final" id="final" hidden>
-      <h2>Final design</h2>
-      <p class="summary" id="final-summary"></p>
+    <section class="block" id="final" hidden>
+      <div class="block-head"><h2>Winner</h2><a class="link" id="report-link" download="chip-design-report.md">Download report</a></div>
       <div id="final-card"></div>
     </section>
 
-    <section class="timeline" id="timeline" hidden>
-      <div class="timeline-head">
+    <section class="block" id="checker" hidden>
+      <div class="block-head">
+        <h2>How designs are judged</h2>
+        <span class="hint">Measured inputs → calibrated simulator → checker</span>
+      </div>
+      <div class="checker-grid" id="checker-grid"></div>
+    </section>
+
+    <section class="block" id="timeline" hidden>
+      <div class="block-head">
         <h2>Iterations</h2>
         <ul class="legend" aria-label="Diagram legend">
           <li><span class="swatch compute"></span>Compute</li>
@@ -42,9 +70,10 @@
           <li><span class="swatch sbuf"></span>SRAM</li>
           <li><span class="swatch dma"></span>DMA</li>
           <li><span class="swatch changed"></span>Changed</li>
+          <li><span class="swatch ghost"></span>Was here</li>
         </ul>
       </div>
-      <p class="explainer">Each iteration, the model modifies the best chip so far, the simulator tests it, and the result feeds the next attempt. Click a diagram for details.</p>
+      <div class="card chart-card" id="chart" hidden></div>
       <ol class="tiles" id="iterations"></ol>
       <div class="detail" id="detail" hidden></div>
     </section>

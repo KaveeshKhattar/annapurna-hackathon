@@ -34,16 +34,15 @@ class ScriptedChat:
         self.prompts.append(user)
         if "Return:\n{\"name\"" in user:
             return self.plan
-        if "placements" in user:
+        if '"regions"' in user:
             return self.floorplans.pop(0) if self.floorplans else {}
         return self.links.pop(0) if self.links else {}
 
 
 def good_floorplan():
-    return {"placements": {**{f"hbm-{i}": [0.02, 0.05 + i * 0.3, 0.15, 0.26] for i in range(3)},
-                           **{f"compute-{i}": [0.22 + (i % 3) * 0.2, 0.2 + (i // 3) * 0.3, 0.17, 0.26] for i in range(6)},
-                           "sbuf-0": [0.84, 0.2, 0.14, 0.5],
-                           **{f"dma-{i}": [0.22 + i * 0.15, 0.85, 0.12, 0.1] for i in range(4)}}}
+    return {"regions": {"hbm-0": "left", "hbm-1": "right", "hbm-2": "left", "sbuf-0": "top",
+                        **{f"compute-{i}": "center" for i in range(6)},
+                        **{f"dma-{i}": "bottom" for i in range(4)}}}
 
 
 def test_staged_rounds_produce_a_valid_design_from_small_calls():
@@ -63,11 +62,11 @@ def test_staged_rounds_produce_a_valid_design_from_small_calls():
 
 def test_bad_floorplan_gets_one_targeted_repair_then_falls_back():
     overlapping = good_floorplan()
-    overlapping["placements"]["compute-1"] = overlapping["placements"]["compute-0"]
+    overlapping["regions"]["hbm-1"] = "center"
     chat = ScriptedChat([overlapping, good_floorplan()])
     proposal = ChipDesignAgent(chat).run({"round": 0, "baseline_config": HardwareDesign.baseline().model_dump()})
     assert proposal["steps"][1] == "floorplan (repaired)"
-    assert "compute-0 overlaps compute-1" in chat.prompts[2]
+    assert "hbm-1 is an HBM stack and must sit on a die edge" in chat.prompts[2]
 
     chat = ScriptedChat([overlapping, overlapping], links=({"links": []}, {"links": []}))
     proposal = ChipDesignAgent(chat).run({"round": 0, "baseline_config": HardwareDesign.baseline().model_dump()})
@@ -112,8 +111,12 @@ def test_campaign_uses_staged_designer_and_records_changes():
     assert campaign["status"] == "completed"
     attempt = campaign["attempts"][0]
     assert attempt["changes"] == PLAN["changes"]
-    assert "HBM bandwidth 2.9 → 3.6 TB/s" in attempt["deltas"]
-    assert "Compute clusters 4 → 6" in attempt["deltas"]
+    texts = [delta["text"] for delta in attempt["deltas"]]
+    assert "HBM bandwidth 2.9 → 3.6 TB/s" in texts
+    assert "Compute clusters 4 → 6" in texts
+    assert attempt["deltas"][0]["pct"] == 50.0          # largest change first (4 → 6 cores)
+    assert {row["key"] for row in attempt["checks"]} >= {"throughput_at_least_baseline", "memory_fit"}
+    assert "bound" in attempt["feedback"]
     assert "compute-5" in attempt["changed_ids"]
     assert "request_outcomes" not in attempt["metrics"]
 
@@ -155,3 +158,26 @@ def test_model_dropping_mid_run_fails_the_campaign_loudly():
     assert campaign["status"] == "failed"
     assert "did not answer" in campaign["error"]
     assert campaign["attempts"] == []
+
+
+def test_narrow_links_are_sent_back_then_widened_to_the_hbm_rate():
+    narrow = {"links": [[a, b, bw / 4] for a, b, bw in GOOD_LINKS["links"]]}
+    chat = ScriptedChat([good_floorplan()], links=(narrow, narrow))
+    proposal = ChipDesignAgent(chat).run({"round": 0, "baseline_config": HardwareDesign.baseline().model_dump()})
+    assert "the links carry only 0.90 of the 3.6 TB/s" in chat.prompts[-1]
+    assert proposal["steps"][-1] == "interconnect (links widened to the HBM rate)"
+    design = HardwareDesign.model_validate(proposal["design"])
+    assert DigitalTwinSimulator(design)._topology_profile()["flow"] >= 3.5
+
+
+def test_unchanged_regions_keep_their_exact_boxes():
+    baseline = HardwareDesign.baseline().model_dump()
+    same_shape = {"name": "Raise utilization", "rationale": "", "changes": [], "targets": {"utilization": 0.8}}
+    regions = {"regions": {"hbm-0": "left", "hbm-1": "right", "sbuf-0": "top",
+                           **{f"compute-{i}": "center" for i in range(4)}, **{f"dma-{i}": "bottom" for i in range(4)}}}
+    links = {"links": [l for l in GOOD_LINKS["links"] if l[0] != "hbm-2" and l[1] not in {"compute-4", "compute-5"}]}
+    proposal = ChipDesignAgent(ScriptedChat([regions], links=(links,), plan=same_shape)).run(
+        {"round": 0, "baseline_config": baseline})
+    before = {c["id"]: (c["x"], c["y"], c["width"], c["height"]) for c in baseline["components"] if c["type"] != "noc"}
+    after = {c["id"]: (c["x"], c["y"], c["width"], c["height"]) for c in proposal["design"]["components"] if c["type"] != "noc"}
+    assert before == after

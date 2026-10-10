@@ -251,6 +251,15 @@ class SimulationResult(BaseModel):
     bottleneck_component_ids: List[str] = Field(default_factory=list)
     component_metrics: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     component_temperatures: Dict[str, float] = Field(default_factory=dict)
+    # Roofline split for a typical request, so the checker can name the limit.
+    prefill_compute_ms: float = 0.0
+    prefill_memory_ms: float = 0.0
+    decode_compute_ms: float = 0.0
+    decode_memory_ms: float = 0.0
+    prefill_bound: str = ""
+    decode_bound: str = ""
+    raw_power_w: float = 0.0
+    usable_hbm_bandwidth_tb_s: float = 0.0
 
     model_config = ConfigDict(extra="ignore")
 
