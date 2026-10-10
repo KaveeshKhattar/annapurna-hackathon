@@ -486,10 +486,41 @@ REPLAY_PROMPTS = [
 ]
 
 
+def _stream_tokens(response: Any) -> Any:
+    """Yield one item per streamed token from an OpenAI-compatible SSE response (content or reasoning)."""
+    for line in response.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            return
+        try:
+            chunk = json.loads(data)
+        except ValueError:
+            continue
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            text = delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning")
+            if text:
+                yield delta
+
+
 def measure_live_workload(base_url: str, metrics_url: str, model: str, requests: int = 8,
-                          concurrency: int = 4, max_tokens: int = 160, timeout: float = 300.0) -> Dict[str, Any]:
-    """Replay a short burst against the live server and measure it three ways."""
+                          concurrency: int = 4, max_tokens: int = 160, timeout: float = 300.0,
+                          live: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Replay a short burst against the live server and measure it three ways.
+
+    Requests stream, so ``live`` (if given) is updated in place as tokens arrive:
+    per-request state and token counts, plus utilization / KV / tokens-per-second
+    samples. The API serves that dict to the page while the replay runs.
+    """
     import httpx  # local import keeps parse helpers usable without httpx
+    from concurrent.futures import ThreadPoolExecutor
+
+    live = live if live is not None else {}
+    lanes = [{"id": i + 1, "state": "queued", "tokens": 0, "max_tokens": max_tokens, "ttft_ms": None, "total_ms": None}
+             for i in range(requests)]
+    live.update(phase="measure", requests=lanes, samples=[], tokens=0, elapsed_s=0.0, concurrency=concurrency)
 
     def scrape() -> Dict[str, Any]:
         return scrape_prometheus(httpx.get(metrics_url, timeout=5.0).text)
@@ -498,36 +529,50 @@ def measure_live_workload(base_url: str, metrics_url: str, model: str, requests:
     monitor = NeuronMonitorSampler().start()
     kv_peak = [0.0]
     stop = threading.Event()
+    started = time.monotonic()
 
-    def watch_kv() -> None:
+    def watch() -> None:
+        last_tokens, last_t = 0, time.monotonic()
         while not stop.wait(0.5):
+            kv = None
             try:
-                kv_peak[0] = max(kv_peak[0], scrape()["scalars"].get("vllm:kv_cache_usage_perc", 0.0))
+                kv = scrape()["scalars"].get("vllm:kv_cache_usage_perc", 0.0)
+                kv_peak[0] = max(kv_peak[0], kv)
             except Exception:  # sampling is best effort
                 pass
+            now, tokens = time.monotonic(), sum(lane["tokens"] for lane in lanes)
+            latest = monitor.samples[-1] if monitor.samples else {}
+            live["samples"].append({"t": round(now - started, 2), "tps": round((tokens - last_tokens) / max(now - last_t, 1e-3), 1),
+                                    "util": latest.get("utilization"), "kv": None if kv is None else round(kv * 100, 2)})
+            live["tokens"], live["elapsed_s"] = tokens, round(now - started, 2)
+            last_tokens, last_t = tokens, now
 
-    watcher = threading.Thread(target=watch_kv, daemon=True)
+    watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     errors: List[str] = []
 
     def one(index: int) -> None:
+        lane = lanes[index]
+        lane["state"] = "prefill"
+        sent = time.monotonic()
+        body = {"model": model, "max_tokens": max_tokens, "temperature": 0.7, "stream": True,
+                "messages": [{"role": "user", "content": REPLAY_CONTEXT + REPLAY_PROMPTS[index % len(REPLAY_PROMPTS)]}]}
         try:
-            httpx.post(f"{base_url.rstrip('/')}/chat/completions", timeout=timeout, json={
-                "model": model, "max_tokens": max_tokens, "temperature": 0.7,
-                "messages": [{"role": "user", "content": REPLAY_CONTEXT + REPLAY_PROMPTS[index % len(REPLAY_PROMPTS)]}],
-            }).raise_for_status()
+            with httpx.stream("POST", f"{base_url.rstrip('/')}/chat/completions", json=body, timeout=timeout) as response:
+                response.raise_for_status()
+                for _ in _stream_tokens(response):
+                    if lane["ttft_ms"] is None:
+                        lane["ttft_ms"] = round((time.monotonic() - sent) * 1000.0, 1)
+                        lane["state"] = "decode"
+                    lane["tokens"] += 1
+            lane["state"] = "done"
         except Exception as exc:
+            lane["state"] = "error"
             errors.append(str(exc))
+        lane["total_ms"] = round((time.monotonic() - sent) * 1000.0, 1)
 
-    started = time.monotonic()
-    pending = list(range(requests))
-    while pending:
-        batch, pending = pending[:concurrency], pending[concurrency:]
-        threads = [threading.Thread(target=one, args=(i,)) for i in batch]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        list(pool.map(one, range(requests)))
     wall = time.monotonic() - started
     stop.set()
     watcher.join(timeout=2)
@@ -537,4 +582,7 @@ def measure_live_workload(base_url: str, metrics_url: str, model: str, requests:
                  "replayed": requests, "concurrency": concurrency})
     if not vllm["available"]:
         vllm["reason"] = errors[0][:160] if errors else "no requests completed"
-    return {"vllm": vllm, "neuron_monitor": neuron, "system_trace": read_system_trace()}
+    live["tokens"], live["elapsed_s"] = sum(lane["tokens"] for lane in lanes), round(wall, 2)
+    live["phase"] = "trace"
+    trace = read_system_trace()
+    return {"vllm": vllm, "neuron_monitor": neuron, "system_trace": trace}

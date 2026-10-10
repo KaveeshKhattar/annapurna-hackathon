@@ -57,8 +57,8 @@ class LLMClient:
         # No silent offline fallback here: a design round either comes from the
         # model or fails loudly, so the UI never passes scripted edits off as AI.
         try:
-            return ChipDesignAgent(self.chat_json, report=context.get("report"),
-                                   max_tokens=self.max_tokens).run(context)
+            return ChipDesignAgent(self.chat_json, report=context.get("report"), max_tokens=self.max_tokens,
+                                   log_call=context.get("log_call")).run(context)
         except httpx.TimeoutException as exc:
             raise ModelUnavailableError(f"{self.model} did not answer within {self.timeout:g} s") from exc
         except httpx.HTTPError as exc:
@@ -82,8 +82,13 @@ class LLMClient:
                              f"Restart serve.sh with MODEL={self.model}, or set ACCELTWIN_LLM_MODEL."}
         return {"ready": True, "served": served, "error": None}
 
-    def chat_json(self, system: str, user: str, max_tokens: int | None = None) -> dict[str, Any]:
-        """Send one chat turn and parse the single JSON object it returns."""
+    def chat_json(self, system: str, user: str, max_tokens: int | None = None,
+                  progress: Any = None) -> dict[str, Any]:
+        """Send one chat turn and parse the single JSON object it returns.
+
+        The reply streams so ``progress(tokens)`` can report live token counts
+        (reasoning tokens included); set ACCELTWIN_LLM_STREAM=false to disable.
+        """
         body: dict[str, Any] = {
             "model": self.model or self._discover_model(),
             "temperature": 0.3,
@@ -94,15 +99,36 @@ class LLMClient:
             body["reasoning_effort"] = self.reasoning_effort
         if self.json_mode:
             body["response_format"] = {"type": "json_object"}
-        response = httpx.post(f"{self.base_url}/chat/completions",
-                              headers={"Authorization": f"Bearer {self.api_key}"},
-                              json=body, timeout=self.timeout)
-        response.raise_for_status()
-        choice = response.json()["choices"][0]
-        raw = (choice.get("message") or {}).get("content") or ""
+        url, headers = f"{self.base_url}/chat/completions", {"Authorization": f"Bearer {self.api_key}"}
+        if os.getenv("ACCELTWIN_LLM_STREAM", "true").lower() in {"0", "false", "no"}:
+            response = httpx.post(url, headers=headers, json=body, timeout=self.timeout)
+            response.raise_for_status()
+            choice = response.json()["choices"][0]
+            raw, finish = (choice.get("message") or {}).get("content") or "", choice.get("finish_reason")
+        else:
+            parts: list[str] = []
+            tokens, finish = 0, None
+            with httpx.stream("POST", url, headers=headers, json={**body, "stream": True}, timeout=self.timeout) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(line[5:])
+                    except ValueError:
+                        continue
+                    for choice in chunk.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        finish = choice.get("finish_reason") or finish
+                        if delta.get("content"):
+                            parts.append(delta["content"])
+                        if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
+                            tokens += 1
+                            if progress:
+                                progress(tokens)
+            raw = "".join(parts)
         if not raw.strip():
-            reason = choice.get("finish_reason")
-            raise ProposalError(f"model returned no answer (finish_reason={reason}); "
+            raise ProposalError(f"model returned no answer (finish_reason={finish}); "
                                 "raise ACCELTWIN_LLM_MAX_TOKENS or lower the reasoning effort")
         return self._parse_json(raw)
 

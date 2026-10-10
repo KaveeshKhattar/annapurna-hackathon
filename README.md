@@ -82,6 +82,29 @@ Trainium or a model endpoint.
 | `ACCELTWIN_REPLAY_CONCURRENCY` | `4` | Requests in flight during the replay |
 | `ACCELTWIN_NEURON_TRACE_DIR` | `/workspace/neuron-trace` | Neuron Explorer capture to summarize |
 
+## Scenarios
+
+The page frames each run as problem → measurement → exploration → solution.
+Pick one of five problems (`app/scenarios.py`); each sets the objective, the hard
+budget, and how the measured workload is reshaped before simulation:
+
+| Scenario | Objective | Budget / guard | Workload |
+| --- | --- | --- | --- |
+| Interactive chat | lower p99 TTFT | 600 W, 85 °C, 650 mm²; throughput ≥ today | as measured, 80% load |
+| Long-context RAG | lower p99 TTFT | same | 4× prompts, ½ outputs |
+| Batch throughput | higher tokens/s | same; p99 TTFT ≤ today | 2× outputs, saturated |
+| Power-capped part | lower p99 TTFT | 350 W, 75 °C, 450 mm²; ≥ 70% of today's throughput | 60% load |
+| Cost-down | smaller die | same as chat; p99 TTFT and throughput ≤/≥ today | as measured |
+
+When today's chip breaks a scenario's budget, the first design that passes every
+check wins, and later designs must beat it. The planner gets objective-specific
+guidance (e.g. an area breakdown for cost-down) so latency advice never pulls an
+area search the wrong way.
+
+While a run is live, the page streams the replay (per-request prefill/decode
+progress, tokens/s, NeuronCore utilization, KV cache) and every model call the
+agent makes (stage, tokens streamed, duration).
+
 ## What the checker measures
 
 Each run starts by replaying a short burst (8 requests, 4 at a time) against the
