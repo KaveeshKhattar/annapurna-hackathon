@@ -3,55 +3,49 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#080c13">
-  <meta name="description" content="An AI chip builder that proposes accelerator designs and tests them in simulation.">
-  <title>Chip Builder AI — Annapurna Lab</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css?v=2.1.1">
-  <script src="/static/app.js?v=2.1.1" defer></script>
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="An agent that designs accelerator chips and tests each iteration in simulation.">
+  <title>Chip Builder</title>
+  <link rel="stylesheet" href="/static/styles.css?v=3.0.0">
+  <script src="/static/app.js?v=3.0.0" defer></script>
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="sidebar" aria-label="Main navigation">
-      <a class="brand" href="#builder"><span class="brand-mark"><span></span><span></span><span></span><span></span></span><span>chip<span class="brand-light">builder</span></span></a>
-      <div class="workspace-switcher"><span class="workspace-icon">A</span><span><b>Annapurna Lab</b><small>AI hardware design</small></span></div>
-      <div class="nav-label">DESIGN SESSION</div>
-      <nav class="nav-list">
-        <a class="nav-item active" href="#builder"><span class="nav-icon">▦</span>Chip builder</a>
-        <a class="nav-item" href="#rounds"><span class="nav-icon">⌁</span>Design rounds</a>
-        <a class="nav-item" href="#results"><span class="nav-icon">◷</span>Simulation results</a>
-      </nav>
-      <div class="sidebar-bottom"><div class="sidebar-help"><div class="help-glyph">?</div><div><b>Design loop</b><small>Propose · simulate · refine</small></div></div><div class="profile-button"><span class="avatar">HT</span><span><b>Hackathon Team</b><small>Accelerator design lab</small></span></div></div>
-    </aside>
+  <main class="page">
+    <header class="masthead">
+      <h1>Chip Builder</h1>
+      <p class="model" id="model-label">gpt-oss-20b</p>
+    </header>
 
-    <main id="builder" class="main-content">
-      <header class="topbar"><div class="breadcrumbs"><span>Annapurna Lab</span><span class="crumb-sep">/</span><b>Chip builder</b></div><div class="topbar-actions"><span class="live-status"><i></i><span id="connection-label">Loading design…</span></span><span class="top-avatar">HT</span></div></header>
-      <div class="page-wrap">
-        <section class="page-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span>AI HARDWARE DESIGN WORKBENCH</div><h1>Chip Builder AI</h1><p>Describe a goal. The AI builds an accelerator, tests it, then uses simulation feedback to improve the next design.</p></div><div class="heading-meta"><span class="meta-label">DESIGN SCHEMA</span><span class="schema-status" id="schema-status"><i></i><span>Waiting for design</span></span></div></section>
-
-        <section class="control-row" aria-label="Design campaign controls"><div class="control-group goal-control"><label for="design-goal">DESIGN GOAL</label><input class="goal-input" id="design-goal" type="text" value="Minimize p99 TTFT without reducing throughput" aria-label="Hardware design goal"></div><div class="control-group workload-control"><label for="workload-select">WORKLOAD TRACE</label><div class="select-wrap"><select id="workload-select"><option value="A">Interactive chat · short context</option><option value="B">Long-context generation</option><option value="C" selected>Burst traffic · held-out evaluation</option></select></div></div><div class="control-spacer"></div><div class="loop-status" id="loop-status"><span class="loop-dot"></span><span>Ready to build</span></div><button class="button button-primary" id="start-campaign" type="button"><span class="play-icon">▶</span><span id="campaign-button-label">Build and test chip</span></button></section>
-
-        <section class="builder-grid" aria-label="AI generated chip design">
-          <article class="panel chip-panel">
-            <div class="panel-heading"><div><div class="eyebrow">CURRENT AI DESIGN</div><h2 id="design-title">Loading accelerator design</h2></div><div class="panel-heading-right"><span class="design-chip" id="design-round">EXAMPLE</span><span class="validity-chip" id="topology-status"><i></i><span>Checking topology</span></span></div></div>
-            <div class="design-summary"><p id="design-rationale">The diagram will show the components and connections in the selected design.</p><span id="design-name" class="mono">—</span></div>
-            <div class="chip-legend" aria-label="Component legend"><span><i class="legend-dot compute"></i>Compute</span><span><i class="legend-dot memory"></i>HBM</span><span><i class="legend-dot cache"></i>SRAM / cache</span><span><i class="legend-dot fabric"></i>Fabric / I/O</span><span class="heat-legend"><i></i>Cool → hot</span></div>
-            <div class="canvas-wrap" id="canvas-wrap"><svg id="chip-canvas" viewBox="0 0 1000 620" role="img" aria-labelledby="chip-svg-title chip-svg-desc" preserveAspectRatio="xMidYMid meet"><title id="chip-svg-title">AI proposed chip design</title><desc id="chip-svg-desc">Hardware components and routed connections from the current design.</desc><g id="chip-graph"></g></svg><div class="canvas-empty" id="canvas-empty" hidden><span class="empty-mark">⌘</span><b>No component topology in this design</b><span id="empty-detail">This is a legacy scalar-only design. A chip diagram appears when the proposal includes components and connections.</span></div></div>
-            <div class="canvas-foot"><span id="canvas-caption"><i class="pulse-dot"></i>Showing exact proposed component geometry</span><span class="mono" id="canvas-count">0 COMPONENTS · 0 LINKS</span></div>
-            <div class="change-strip" id="change-strip" aria-live="polite"><span class="change-icon">↝</span><span id="change-summary">Start a build to see how each proposal changes the chip.</span></div>
-          </article>
-          <aside class="panel inspector-panel" aria-labelledby="inspector-title"><div class="panel-heading"><div><div class="eyebrow">DESIGN INSPECTOR</div><h2 id="inspector-title">Component details</h2></div><span class="inspector-count" id="inspector-count">0 items</span></div><div class="inspector-empty" id="inspector-empty">Select a block on the chip to inspect its design parameters and simulated behavior.</div><div class="inspector-content" id="inspector-content" hidden><div class="component-identity"><span class="component-icon" id="component-icon">▦</span><div><b id="component-name">—</b><small id="component-type">—</small></div></div><dl class="property-list" id="component-properties"></dl><div class="component-telemetry" id="component-telemetry"></div></div><div class="connection-list-wrap"><div class="eyebrow">CONNECTIONS</div><div id="connection-list" class="connection-list"><span class="muted">No links in this design</span></div></div><div class="validation-box" id="validation-box"><b><i></i><span id="validation-title">Topology check</span></b><ul id="validation-messages"><li>Waiting for design graph</li></ul></div></aside>
-        </section>
-
-        <section class="content-grid lower-grid">
-          <article class="panel timeline-panel" id="rounds"><div class="panel-heading"><div><div class="eyebrow">PROPOSE → SIMULATE → REFINE</div><h2>Design rounds</h2></div><span class="round-counter" id="round-counter">0 proposals</span></div><div class="round-list" id="round-list"><div class="round-empty">Each LLM proposal and checker result will appear here.</div></div></article>
-          <article class="panel results-panel" id="results"><div class="panel-heading"><div><div class="eyebrow">SIMULATION CHECKER</div><h2>Predicted performance</h2></div><span class="modeled-chip"><i></i>MODELED</span></div><div class="metrics-grid" aria-label="Checker output metrics"><div class="result-metric"><span>P99 TTFT</span><b><span id="metric-ttft">—</span><small>ms</small></b></div><div class="result-metric"><span>Throughput</span><b><span id="metric-throughput">—</span><small>tok/s</small></b></div><div class="result-metric"><span>Power</span><b><span id="metric-power">—</span><small>W</small></b></div><div class="result-metric"><span>Peak temperature</span><b><span id="metric-temp">—</span><small>°C</small></b></div><div class="result-metric"><span>Estimated area</span><b><span id="metric-area">—</span><small>mm²</small></b></div></div><div class="checker-note" id="checker-note">Run the design through the simulator to get checker feedback.</div></article>
-        </section>
-        <footer class="page-footer"><span>ANNAPURNA <span class="footer-sep">/</span> AI CHIP DESIGN</span><span>LLM design → simulator feedback → refined chip</span></footer>
+    <form class="brief" id="brief-form">
+      <label for="goal">Design brief</label>
+      <textarea id="goal" rows="2">Minimize p99 time-to-first-token without reducing throughput.</textarea>
+      <div class="brief-footer">
+        <p class="budget">Budget: 600 W · 85 °C · 650 mm² · up to 5 iterations</p>
+        <button type="submit" id="start">Design chip</button>
       </div>
-    </main>
-  </div>
+    </form>
+
+    <p class="status" id="status" hidden></p>
+
+    <section class="final" id="final" hidden>
+      <h2>Final design</h2>
+      <p class="summary" id="final-summary"></p>
+      <div id="final-card"></div>
+    </section>
+
+    <section class="timeline" id="timeline" hidden>
+      <div class="timeline-head">
+        <h2>Iterations</h2>
+        <ul class="legend" aria-label="Diagram legend">
+          <li><span class="swatch compute"></span>Compute</li>
+          <li><span class="swatch hbm"></span>HBM</li>
+          <li><span class="swatch sbuf"></span>SRAM</li>
+          <li><span class="swatch dma"></span>DMA</li>
+          <li><span class="swatch changed"></span>Changed</li>
+        </ul>
+      </div>
+      <div id="iterations"></div>
+    </section>
+  </main>
 </body>
 </html>

@@ -43,6 +43,35 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "acceltwin"}
 
 
+@app.get("/api/config")
+async def config() -> dict[str, Any]:
+    proposer = orchestrator.proposer
+    return {"model": getattr(proposer, "model", None), "mode": getattr(proposer, "mode", "custom")}
+
+
+_HEAVY_METRICS = {"request_outcomes", "thermal_grid", "component_metrics", "component_temperatures"}
+
+
+def _compact(campaign: dict[str, Any]) -> dict[str, Any]:
+    """Drop per-request and per-cell detail the timeline UI never draws."""
+    def slim_metrics(metrics: Any) -> Any:
+        return {k: v for k, v in metrics.items() if k not in _HEAVY_METRICS} if isinstance(metrics, dict) else metrics
+
+    def slim_attempt(attempt: Any) -> Any:
+        if not isinstance(attempt, dict):
+            return attempt
+        slim = {k: v for k, v in attempt.items() if k not in {"design_diff", "baseline_design_diff"}}
+        slim["metrics"] = slim_metrics(attempt.get("metrics"))
+        return slim
+
+    out = {k: v for k, v in campaign.items() if k not in {"events", "report", "latest_design"}}
+    out["baseline_metrics"] = slim_metrics(campaign.get("baseline_metrics"))
+    out["source_baseline_metrics"] = slim_metrics(campaign.get("source_baseline_metrics"))
+    out["attempts"] = [slim_attempt(a) for a in campaign.get("attempts", [])]
+    out["best_attempt"] = slim_attempt(campaign.get("best_attempt"))
+    return out
+
+
 @app.get("/api/state")
 async def state() -> dict[str, Any]:
     baseline = next(reversed(orchestrator.baselines.values()), None) if orchestrator.baselines else None
@@ -125,10 +154,12 @@ async def create_campaign(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/api/campaigns/{campaign_id}")
-async def get_campaign(campaign_id: str) -> dict[str, Any]:
+async def get_campaign(campaign_id: str, compact: bool = False) -> dict[str, Any]:
     campaign = orchestrator.get_campaign(campaign_id)
     if campaign is None:
         raise HTTPException(status_code=404, detail="campaign not found")
+    if compact:
+        return _compact(campaign)
     return {key: value for key, value in campaign.items() if key not in {"events", "report"}}
 
 

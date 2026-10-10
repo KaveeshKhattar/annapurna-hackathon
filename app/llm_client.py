@@ -10,6 +10,9 @@ from typing import Any
 import httpx
 
 
+DEFAULT_MODEL = "openai/gpt-oss-20b"
+
+
 class ProposalError(ValueError):
     """The proposer did not return a valid structured design."""
 
@@ -25,16 +28,59 @@ class LLMClient:
         model: str | None = None,
         api_key: str | None = None,
         mode: str | None = None,
-        timeout: float = 45.0,
+        timeout: float | None = None,
     ) -> None:
         self.base_url = (base_url or os.getenv("ACCELTWIN_LLM_BASE_URL") or os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")).rstrip("/")
-        self.model = model or os.getenv("ACCELTWIN_LLM_MODEL") or os.getenv("LLM_MODEL")
+        self.model = model or os.getenv("ACCELTWIN_LLM_MODEL") or os.getenv("LLM_MODEL") or DEFAULT_MODEL
         self.api_key = api_key or os.getenv("ACCELTWIN_LLM_API_KEY") or os.getenv("LLM_API_KEY", "local")
         explicit_mode = os.getenv("ACCELTWIN_LLM_MODE")
         if os.getenv("ACCELTWIN_MOCK_LLM", "false").lower() in {"1", "true", "yes"}:
             explicit_mode = "mock"
         self.mode = (mode or explicit_mode or "auto").lower()
-        self.timeout = timeout
+        # gpt-oss on Neuron is slow per token and spends some of its budget on
+        # reasoning, so calls get a generous timeout and token budget.
+        self.timeout = timeout or float(os.getenv("ACCELTWIN_LLM_TIMEOUT", "240"))
+        self.max_tokens = int(os.getenv("ACCELTWIN_LLM_MAX_TOKENS", "3000"))
+        self.reasoning_effort = os.getenv("ACCELTWIN_LLM_REASONING_EFFORT", "low").strip()
+        self.json_mode = os.getenv("ACCELTWIN_LLM_JSON_MODE", "false").lower() in {"1", "true", "yes"}
+
+    def design_round(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Design one complete chip through several small, validated model calls."""
+        if self.mode in {"mock", "rule", "rules", "offline"}:
+            return self._rule_proposal(context)
+        from .agent import ChipDesignAgent
+
+        try:
+            return ChipDesignAgent(self.chat_json, report=context.get("report"),
+                                   max_tokens=self.max_tokens).run(context)
+        except (httpx.HTTPError, ModelDiscoveryError):
+            if self.mode in {"openai", "remote", "strict"}:
+                raise
+            return self._rule_proposal(context)
+
+    def chat_json(self, system: str, user: str, max_tokens: int | None = None) -> dict[str, Any]:
+        """Send one chat turn and parse the single JSON object it returns."""
+        body: dict[str, Any] = {
+            "model": self.model or self._discover_model(),
+            "temperature": 0.3,
+            "max_tokens": max_tokens or self.max_tokens,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
+        if self.json_mode:
+            body["response_format"] = {"type": "json_object"}
+        response = httpx.post(f"{self.base_url}/chat/completions",
+                              headers={"Authorization": f"Bearer {self.api_key}"},
+                              json=body, timeout=self.timeout)
+        response.raise_for_status()
+        choice = response.json()["choices"][0]
+        raw = (choice.get("message") or {}).get("content") or ""
+        if not raw.strip():
+            reason = choice.get("finish_reason")
+            raise ProposalError(f"model returned no answer (finish_reason={reason}); "
+                                "raise ACCELTWIN_LLM_MAX_TOKENS or lower the reasoning effort")
+        return self._parse_json(raw)
 
     def propose(self, prompt: str, schema: dict[str, Any], context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Return exactly one JSON design object. `auto` falls back when vLLM is unavailable."""
@@ -99,10 +145,26 @@ class LLMClient:
         try:
             value = json.loads(candidate)
         except json.JSONDecodeError as exc:
-            raise ProposalError(f"response is not valid JSON: {exc.msg}") from exc
+            # Reasoning models sometimes wrap the object in prose; take the
+            # first complete JSON object in the reply.
+            value = LLMClient._first_object(candidate)
+            if value is None:
+                raise ProposalError(f"response is not valid JSON: {exc.msg}") from exc
         if not isinstance(value, dict):
             raise ProposalError("response must be a JSON object")
         return value
+
+    @staticmethod
+    def _first_object(text: str) -> dict[str, Any] | None:
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", text):
+            try:
+                value, _end = decoder.raw_decode(text, match.start())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+        return None
 
     @staticmethod
     def _rule_proposal(context: dict[str, Any]) -> dict[str, Any]:
@@ -190,7 +252,8 @@ class LLMClient:
                 rationale = "Reposition the first functional block to explore a distinct physical floorplan."
             config["components"] = components
             config["connections"] = connections
-            return {"name": f"offline chip layout {round_index + 1}", "rationale": rationale, "design": config}
+            return {"name": f"offline chip layout {round_index + 1}", "rationale": rationale, "design": config,
+                    "source": "offline"}
 
         # Compatibility for scalar-only models/callers during migration.
         # These knobs are illustrative defaults. The simulator owns allowed ranges and
@@ -212,5 +275,6 @@ class LLMClient:
             "name": f"offline architecture candidate {round_index + 1}",
             "rationale": f"Explore a bounded increase to {knob}; hard gates remain authoritative.",
             "design": config,
+            "source": "offline",
         }
 

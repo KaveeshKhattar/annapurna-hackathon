@@ -74,6 +74,25 @@ Trainium or a model endpoint.
 | `ACCELTWIN_DB_PATH` | `./data/acceltwin.db` | Local SQLite database |
 | `ACCELTWIN_EVENT_LOG` | `./data/events.jsonl` | Append-only audit trail |
 | `ACCELTWIN_MAX_ROUNDS` | `5` | Safety cap for the design loop |
+| `ACCELTWIN_LLM_TIMEOUT` | `240` | Seconds per model call |
+| `ACCELTWIN_LLM_MAX_TOKENS` | `3000` | Output budget per call, including gpt-oss reasoning |
+| `ACCELTWIN_LLM_REASONING_EFFORT` | `low` | gpt-oss reasoning effort; empty to omit |
+| `ACCELTWIN_LLM_JSON_MODE` | `false` | Send `response_format: json_object` |
+
+## How a design round works
+
+`gpt-oss-20b` is served with an 8k context, so one round is split into small,
+validated calls (`app/agent.py`) instead of one call for the whole chip graph:
+
+1. **Plan** picks architecture totals (clusters, cores, TFLOPS, HBM, SRAM, DMA,
+   utilization, power, cooling) and states the intended changes.
+2. **Floorplan** places only the blocks that plan implies.
+3. **Interconnect** wires the placed blocks.
+
+Code derives each block's resources from the plan totals, so the graph always
+matches its scalar fields. Each stage that fails validation gets one repair call
+with the exact errors. If the repair still fails, a deterministic layout or wiring
+is used and the round's `steps` record it.
 
 ## Project map
 

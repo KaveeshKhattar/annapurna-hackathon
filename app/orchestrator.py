@@ -126,6 +126,46 @@ class CampaignOrchestrator:
         return {"scalars": scalar_changes, "components": changes(old_components, new_components),
                 "connections": changes(old_connections, new_connections)}
 
+    _DELTA_LABELS = {
+        "compute_cores": ("Compute cores", ""),
+        "peak_compute_tflops": ("Compute", " TFLOPS"),
+        "hbm_gb": ("HBM capacity", " GB"),
+        "hbm_bandwidth_tb_s": ("HBM bandwidth", " TB/s"),
+        "sbuf_gb": ("On-chip SRAM", " GB"),
+        "dma_engines": ("DMA engines", ""),
+        "utilization": ("Utilization", ""),
+        "power_limit_w": ("Power limit", " W"),
+        "cooling_capacity_w": ("Cooling", " W"),
+    }
+
+    @classmethod
+    def _change_summary(cls, previous: Any, current: Any) -> tuple[list[str], list[str]]:
+        """Readable parameter deltas plus the IDs of blocks that were added, moved, or resized."""
+        before, after = _plain(previous) or {}, _plain(current) or {}
+        fmt = lambda value: f"{value:.3g}" if isinstance(value, float) else str(value)
+        deltas = []
+        for key, (label, unit) in cls._DELTA_LABELS.items():
+            a, b = before.get(key), after.get(key)
+            if a is not None and b is not None and a != b:
+                deltas.append(f"{label} {fmt(a)} → {fmt(b)}{unit}")
+        old = {c.get("id"): c for c in before.get("components") or [] if isinstance(c, dict)}
+        new = {c.get("id"): c for c in after.get("components") or [] if isinstance(c, dict)}
+        for kind, label in (("compute_cluster", "Compute clusters"), ("hbm", "HBM stacks")):
+            a = sum(1 for c in old.values() if c.get("type") == kind)
+            b = sum(1 for c in new.values() if c.get("type") == kind)
+            if a != b:
+                deltas.append(f"{label} {a} → {b}")
+        changed = [cid for cid, comp in new.items() if cid not in old or any(
+            abs(float(comp.get(k) or 0) - float(old[cid].get(k) or 0)) > 0.005
+            for k in ("x", "y", "width", "height"))]
+        moved = [cid for cid in changed if cid in old]
+        if moved:
+            deltas.append(f"Moved or resized {len(moved)} block{'s' if len(moved) != 1 else ''}")
+        a, b = len(before.get("connections") or []), len(after.get("connections") or [])
+        if a != b:
+            deltas.append(f"Links {a} → {b}")
+        return deltas, changed
+
     def _default_design(self) -> Any:
         model, _ = self._models()
         if model is None:
@@ -272,6 +312,7 @@ class CampaignOrchestrator:
             "events": [],
             "best_attempt": None,
             "latest_design": baseline.get("design", {}),
+            "activity": "Starting",
             "created_at": time.time(),
         }
         self.campaigns[campaign_id] = campaign
@@ -286,6 +327,8 @@ class CampaignOrchestrator:
         baseline_p99 = self._metric(baseline_metrics, "ttft_p99_ms", "predicted_p99_ttft_ms")
         best_p99 = baseline_p99
         best_design = campaign["baseline_design"]
+        best_metrics = baseline_metrics
+        history: list[dict[str, Any]] = []
         seen: set[str] = set()
         stale_rounds = 0
         design_schema = self._design_schema()
@@ -293,33 +336,57 @@ class CampaignOrchestrator:
             prompt = self._prompt(campaign, round_no, best_design, best_p99)
             context = {
                 "round": round_no - 1,
+                "max_rounds": campaign["max_rounds"],
+                "goal": campaign["goal"],
+                "constraints": campaign["constraints"],
                 "baseline_config": best_design,
                 "baseline_metrics": baseline_metrics,
+                "best_metrics": best_metrics,
+                "history": history,
                 "feedback": campaign["attempts"][-1].get("feedback") if campaign["attempts"] else None,
                 "current_design": campaign.get("latest_design", best_design),
                 "baseline_design": campaign.get("baseline_design", {}),
+                "report": lambda text: self._activity(campaign, text),
             }
             raw: dict[str, Any] = {}
-            try:
-                raw = self.proposer.propose(prompt, design_schema, context)
-                design = self._extract_design(raw)
-                design = self._build_design(design)
-            except Exception as first_error:
-                self._emit(campaign, "proposal.invalid", {"round": round_no, "error": str(first_error)})
-                # Exactly one repair attempt. If the local model is unavailable in
-                # auto mode, its deterministic fallback keeps the demo runnable.
+            if callable(getattr(self.proposer, "design_round", None)):
+                # Staged multi-call design runs in a worker thread so the API
+                # keeps serving progress while the model works.
                 try:
-                    raw = self.proposer.repair(prompt, json.dumps(raw), str(first_error), design_schema)
+                    raw = await asyncio.to_thread(self.proposer.design_round, context)
                     design = self._build_design(self._extract_design(raw))
-                except Exception as repair_error:
-                    if getattr(self.proposer, "mode", "") in {"mock", "rule", "rules", "offline"}:
-                        raw = self.proposer._rule_proposal(context)
+                except Exception as exc:
+                    attempt = {"id": str(uuid.uuid4()), "round": round_no, "name": "Proposal failed",
+                               "accepted": False, "feedback": f"The model could not produce a design: {exc}"}
+                    campaign["attempts"].append(attempt)
+                    history.append({"round": round_no, "name": attempt["name"], "outcome": "no valid design"})
+                    self._emit(campaign, "proposal.invalid", {"round": round_no, "error": str(exc)})
+                    stale_rounds += 1
+                    if stale_rounds >= campaign["early_stop_patience"]:
+                        campaign["stop_reason"] = "no accepted improvement"
+                        break
+                    continue
+            else:
+                try:
+                    raw = self.proposer.propose(prompt, design_schema, context)
+                    design = self._extract_design(raw)
+                    design = self._build_design(design)
+                except Exception as first_error:
+                    self._emit(campaign, "proposal.invalid", {"round": round_no, "error": str(first_error)})
+                    # Exactly one repair attempt. If the local model is unavailable in
+                    # auto mode, its deterministic fallback keeps the demo runnable.
+                    try:
+                        raw = self.proposer.repair(prompt, json.dumps(raw), str(first_error), design_schema)
                         design = self._build_design(self._extract_design(raw))
-                    else:
-                        campaign["status"] = "failed"
-                        campaign["error"] = f"proposal failed after one repair: {repair_error}"
-                        self._emit(campaign, "campaign.failed", {"error": campaign["error"]})
-                        return
+                    except Exception as repair_error:
+                        if getattr(self.proposer, "mode", "") in {"mock", "rule", "rules", "offline"}:
+                            raw = self.proposer._rule_proposal(context)
+                            design = self._build_design(self._extract_design(raw))
+                        else:
+                            campaign["status"] = "failed"
+                            campaign["error"] = f"proposal failed after one repair: {repair_error}"
+                            self._emit(campaign, "campaign.failed", {"error": campaign["error"]})
+                            return
 
             design_data = _plain(design)
             # Canonical full-design serialization includes all component positions,
@@ -340,6 +407,11 @@ class CampaignOrchestrator:
             seen.add(fingerprint)
             previous_design = campaign.get("latest_design", campaign.get("baseline_design", {}))
             design_diff = self._design_diff(previous_design, design_data)
+            deltas, changed_ids = self._change_summary(best_design, design_data)
+            rationale = _get(raw, "rationale", default="") or ""
+            changes = [str(item) for item in _get(raw, "changes", default=None) or [] if str(item).strip()]
+            if not changes and rationale:
+                changes = [rationale]
             campaign["latest_design"] = design_data
             self._emit(campaign, "design.proposed", {
                 "round": round_no,
@@ -348,6 +420,7 @@ class CampaignOrchestrator:
                 "design": design_data,
                 "design_diff": design_diff,
             })
+            self._activity(campaign, f"Round {round_no}: simulating the design")
             try:
                 result = await self._evaluate(design, self._trace(campaign["trace"]))
                 metrics = _plain(result)
@@ -374,6 +447,8 @@ class CampaignOrchestrator:
                 "rationale": _get(raw, "rationale", default=""),
                 "design": design_data, "metrics": metrics, "gate_results": gates,
                 "accepted": accepted, "improved": improved,
+                "changes": changes, "deltas": deltas, "changed_ids": changed_ids,
+                "source": _get(raw, "source", default="model"), "steps": _get(raw, "steps", default=[]),
                 "topology_errors": topology_errors,
                 "design_diff": design_diff,
                 "baseline_design_diff": self._design_diff(campaign.get("baseline_design", {}), design_data),
@@ -382,9 +457,15 @@ class CampaignOrchestrator:
             campaign["attempts"].append(attempt)
             self.designs[attempt_id] = attempt
             self._emit(campaign, "design.evaluated", attempt)
+            failed = [gate for gate, passed in gates.items() if not passed]
+            history.append({"round": round_no, "name": attempt["name"], "changes": changes,
+                            "outcome": (f"p99 {p99:g} ms, " if p99 is not None else "")
+                            + ("rejected: " + ", ".join(failed) if failed
+                               else "new best" if improved else "passed but not better")})
             if improved:
                 best_p99 = p99
                 best_design = design_data
+                best_metrics = metrics
                 campaign["best_attempt"] = attempt
                 stale_rounds = 0
                 self._emit(campaign, "campaign.best_updated", {"attempt_id": attempt_id, "p99_ttft_ms": p99,
@@ -400,6 +481,7 @@ class CampaignOrchestrator:
                 campaign["stop_reason"] = "no accepted improvement"
                 break
         campaign["status"] = "completed"
+        campaign["activity"] = "Done"
         campaign["completed_at"] = time.time()
         campaign["report"] = render_campaign_report(campaign)
         self._emit(campaign, "campaign.completed", {"stop_reason": campaign.get("stop_reason"), "rounds": len(campaign["attempts"])})
@@ -408,7 +490,7 @@ class CampaignOrchestrator:
     def _extract_design(proposal: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(proposal, dict):
             raise ProposalError("proposal must be an object")
-        extra = set(proposal) - {"name", "rationale", "design"}
+        extra = set(proposal) - {"name", "rationale", "design", "changes", "steps", "source"}
         if extra:
             raise ProposalError(f"proposal contains unexpected fields: {', '.join(sorted(extra))}")
         if "name" in proposal and not isinstance(proposal["name"], str):
@@ -529,6 +611,10 @@ class CampaignOrchestrator:
             f"Checker feedback: {json.dumps(campaign['attempts'][-1].get('feedback') if campaign['attempts'] else None)}. "
             "Return a complete corrected graph with every connection endpoint referencing an existing component ID."
         )
+
+    def _activity(self, campaign: dict[str, Any], text: str) -> None:
+        campaign["activity"] = text
+        self._emit(campaign, "agent.step", {"text": text})
 
     @staticmethod
     def _emit(campaign: dict[str, Any], event_type: str, data: dict[str, Any]) -> None:
