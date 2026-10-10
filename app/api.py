@@ -43,6 +43,12 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "acceltwin"}
 
 
+@app.get("/api/scenarios")
+async def scenarios() -> list[dict[str, Any]]:
+    from .scenarios import public_scenarios
+    return public_scenarios()
+
+
 @app.get("/api/config")
 async def config() -> dict[str, Any]:
     proposer = orchestrator.proposer

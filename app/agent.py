@@ -15,8 +15,10 @@ deterministic layout or wiring keeps the round usable and the step log says so.
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
+import time
 from typing import Any, Callable
 
 from .llm_client import ProposalError
@@ -66,17 +68,43 @@ def _round(value: float, digits: int = 4) -> float:
 
 class ChipDesignAgent:
     def __init__(self, chat: ChatFn, report: Callable[[str], None] | None = None,
-                 max_tokens: int = 3000) -> None:
+                 max_tokens: int = 3000, log_call: Callable[[dict], None] | None = None) -> None:
         self.chat = chat
         self.report = report or (lambda _text: None)
+        self.log_call = log_call or (lambda _entry: None)
         self.max_tokens = max_tokens
         self.steps: list[str] = []
+        self.round = 0
+        try:
+            self._streams = "progress" in inspect.signature(chat).parameters
+        except (TypeError, ValueError):
+            self._streams = False
+
+    def _ask(self, stage: str, prompt: str) -> dict:
+        """One model call, logged (and updated live while it streams) for the progress view."""
+        entry = {"round": self.round, "stage": stage, "status": "running", "tokens": 0,
+                 "started": time.time(), "ms": None}
+        self.log_call(entry)
+        started = time.monotonic()
+        try:
+            if self._streams:
+                result = self.chat(SYSTEM, prompt, self.max_tokens, progress=lambda n: entry.__setitem__("tokens", n))
+            else:
+                result = self.chat(SYSTEM, prompt, self.max_tokens)
+            entry["status"] = "done"
+            return result
+        except Exception:
+            entry["status"] = "error"
+            raise
+        finally:
+            entry["ms"] = round((time.monotonic() - started) * 1000.0)
 
     # ------------------------------------------------------------------ public
 
     def run(self, context: dict[str, Any]) -> dict[str, Any]:
         start = dict(context.get("baseline_config") or HardwareDesign.baseline().model_dump(mode="json"))
         round_no = int(context.get("round", 0)) + 1
+        self.round = round_no
 
         self.report(f"Round {round_no}: planning the architecture")
         plan = self._plan(context, start)
@@ -110,7 +138,7 @@ class ChipDesignAgent:
                 prompt + "\n\nYour previous reply was rejected: " + "; ".join(errors)
                 + ". Return the corrected JSON object.")
             try:
-                raw = self.chat(SYSTEM, text, self.max_tokens)
+                raw = self._ask("plan", text)
                 plan = self._parse_plan(raw, current)
                 self.steps.append("plan" if attempt == 0 else "plan (repaired)")
                 return plan
@@ -129,17 +157,26 @@ class ChipDesignAgent:
             caps.append(f"peak temperature <= {constraints['max_temperature_c']:g} C")
         if "max_area_mm2" in constraints:
             caps.append(f"area <= {constraints['max_area_mm2']:g} mm2")
+        if "max_p99_ttft_ms" in constraints:
+            caps.append(f"p99 TTFT <= {constraints['max_p99_ttft_ms']:.4g} ms (no worse than today)")
+        objective = context.get("objective") or {"label": "p99 time-to-first-token (TTFT)", "direction": "min"}
+        floor = float(constraints.get("throughput_floor", 1.0))
+        throughput_floor = _num(baseline.get("throughput_tokens_s"))
+        workload = context.get("workload") or {}
+        shape = (f" ({workload.get('prompt_tokens')} prompt and {workload.get('generation_tokens')} output tokens per request, "
+                 f"bursts at {float(workload.get('load', 0.8)):.0%} of today's capacity)") if workload.get("prompt_tokens") else ""
         history = context.get("history") or []
         history_lines = "\n".join(
             f"- round {item.get('round')}: {item.get('name')} | changes: {'; '.join(item.get('changes') or []) or 'n/a'}"
             f" | {item.get('outcome')}" for item in history[-4:]) or "- none yet"
         bounds = ", ".join(f"{key} {lo:g}-{hi:g}" for key, (lo, hi, _kind) in BOUNDS.items())
         signals = "\n".join(f"- {line}" for line in context.get("signals") or []) or "- no live measurements available"
+        strategy = self._strategy(objective, current, best, constraints)
         return f"""Design brief: {context.get('goal') or 'Minimize p99 time-to-first-token without reducing throughput.'}
 
-Workload: a {start.get('model_size_b', 13):g}B-parameter LLM with {start.get('weight_bytes_per_parameter', 2):g}-byte weights, served under a bursty request trace.
-Score: lower simulated p99 time-to-first-token (TTFT) is better.
-Hard checks: throughput >= {self._fmt(baseline.get('throughput_tokens_s'))} tokens/s (baseline), weights + KV cache fit in HBM{', ' + ', '.join(caps) if caps else ''}.
+Workload: a {start.get('model_size_b', 13):g}B-parameter LLM with {start.get('weight_bytes_per_parameter', 2):g}-byte weights, served under a bursty request trace{shape}.
+Score: {'lower' if objective['direction'] == 'min' else 'higher'} simulated {objective['label']} is better.
+Hard checks: throughput >= {self._fmt(None if throughput_floor is None else throughput_floor * floor)} tokens/s{'' if floor == 1 else f' ({floor:.0%} of today)'}, weights + KV cache fit in HBM{', ' + ', '.join(caps) if caps else ''}.
 
 How the simulator behaves:
 - prefill and decode time = max(compute time, HBM traffic time); compute time scales with 1 / (TFLOPS x utilization)
@@ -150,6 +187,9 @@ How the simulator behaves:
 
 Measured on the live Trainium chip and from the simulator:
 {signals}
+
+What moves the score:
+{strategy}
 
 Current best design totals: {json.dumps(current)}
 Its simulated result: {self._metrics_line(best)}
@@ -184,6 +224,33 @@ Return:
         rationale = str(raw.get("rationale") or "").strip()
         name = str(raw.get("name") or "").strip()[:60] or "Untitled design"
         return {"name": name, "rationale": rationale, "changes": changes, "targets": resolved}
+
+    @staticmethod
+    def _strategy(objective: dict[str, Any], current: dict[str, Any], best: dict[str, Any],
+                  constraints: dict[str, Any]) -> str:
+        """Objective-specific guidance, so latency advice does not pull an area or throughput search off course."""
+        metric = objective.get("metric", "ttft_p99_ms")
+        decode = best.get("decode_bound")
+        prefill = best.get("prefill_bound")
+        if metric == "area_mm2":
+            parts = {"compute cores": current["compute_cores"] * 42.0, "HBM": current["hbm_gb"] * 1.45,
+                     "SRAM": current["sbuf_gb"] * 0.65, "DMA": current["dma_engines"] * 3.5, "NoC": 120.0}
+            need = _num(best.get("peak_memory_gb"))
+            lines = ["- area by part: " + ", ".join(f"{k} {v:.0f} mm2" for k, v in sorted(parts.items(), key=lambda kv: -kv[1])),
+                     "- every mm2 removed is progress; adding anything makes the score worse"]
+            if need:
+                lines.append(f"- HBM must still hold weights + KV cache: hbm_gb >= {math.ceil(need)}")
+            if decode == "memory":
+                lines.append("- decode is memory-bound, so compute cores and TFLOPS are slack: cut them first, keep HBM bandwidth")
+            if "max_p99_ttft_ms" in constraints:
+                lines.append(f"- p99 TTFT may rise up to {constraints['max_p99_ttft_ms']:.4g} ms; spend that slack on removing area")
+            return "\n".join(lines)
+        if metric == "throughput_tokens_s":
+            return ("- the chip is saturated, so throughput rises only if each request is served faster\n"
+                    f"- decode is {decode or 'unknown'}-bound and prefill is {prefill or 'unknown'}-bound: grow the resource of the bound phase\n"
+                    "- stay inside the power and area caps; extra resources on the non-bound side are wasted")
+        return (f"- p99 TTFT is queueing plus prefill: decode is {decode or 'unknown'}-bound and prefill is {prefill or 'unknown'}-bound\n"
+                "- speed up the bound phase first; resources on the non-bound side add area and power for nothing")
 
     # -------------------------------------------------------------- stage 2
 
@@ -245,7 +312,7 @@ Return: {{"regions": {{"<block id>": "left|right|top|bottom|center"}}}} listing 
                 prompt + "\n\nYour previous answer was rejected:\n- " + "\n- ".join(errors[:8])
                 + "\nFix these problems and return every block again.")
             try:
-                raw = self.chat(SYSTEM, text, self.max_tokens)
+                raw = self._ask("floorplan", text)
             except ProposalError as exc:
                 errors = [str(exc)]
                 continue
@@ -392,7 +459,7 @@ Return: {{"links": [["hbm-0", "noc-0", 1.0], ...]}}"""
                 prompt + "\n\nYour previous wiring was rejected:\n- " + "\n- ".join(errors[:8])
                 + "\nFix these problems and return all links again.")
             try:
-                raw = self.chat(SYSTEM, text, self.max_tokens)
+                raw = self._ask("wiring", text)
             except ProposalError as exc:
                 errors = [str(exc)]
                 continue

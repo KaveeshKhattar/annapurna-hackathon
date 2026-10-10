@@ -14,6 +14,7 @@ from typing import Any
 
 from .llm_client import LLMClient, ModelUnavailableError, ProposalError
 from .report import render_campaign_report
+from .scenarios import OBJECTIVES, get_scenario
 
 
 MIN_IMPROVEMENT = 0.01
@@ -215,6 +216,10 @@ class CampaignOrchestrator:
                 line += (f" Device profile: arithmetic intensity {f(ai, 1)} FLOP/B vs ridge {f(ridge)} → "
                          f"{'memory' if ai < ridge else 'compute'}-bound; HBM bandwidth utilization {f(system.get('mbu_pct'))}%.")
             lines.append(line)
+        if not campaign.get("baseline_feasible", True):
+            failed = [row["label"] for row in campaign.get("baseline_checks") or [] if row.get("passed") is False]
+            lines.append("Today's chip does not meet this scenario's budget (" + ", ".join(failed)
+                         + "); the first design that passes every check wins, then later ones must beat it.")
         if base.get("prefill_bound"):
             lines.append(f"Simulator on the baseline: prefill is {base['prefill_bound']}-bound, decode is {base['decode_bound']}-bound.")
         return lines
@@ -324,7 +329,10 @@ class CampaignOrchestrator:
         constraints = request.get("constraints", {})
         if not isinstance(constraints, dict):
             raise ValueError("constraints must be a JSON object")
-        constraints = dict(constraints)
+        # A scenario supplies the budget, objective and workload shape; explicit
+        # request fields still win. Legacy baseline_id runs only use one if asked.
+        scenario = get_scenario(request.get("scenario")) if request.get("scenario") or not request.get("baseline_id") else None
+        constraints = {**(scenario["constraints"] if scenario else {}), **constraints}
         for cap in ("max_power_w", "max_temperature_c", "max_area_mm2"):
             if cap in request and cap not in constraints:
                 constraints[cap] = request[cap]
@@ -343,7 +351,7 @@ class CampaignOrchestrator:
         baseline_id = request.get("baseline_id")
         if not baseline_id:
             # Measure the live workload in the background, then calibrate and run.
-            campaign = self._new_campaign(request, rounds, patience, constraints)
+            campaign = self._new_campaign(request, rounds, patience, constraints, scenario)
             self.campaigns[campaign["id"]] = campaign
             self._emit(campaign, "campaign.started", {"max_rounds": rounds, "trace": "live"})
             asyncio.create_task(self._prepare_and_run(campaign, request))
@@ -383,11 +391,18 @@ class CampaignOrchestrator:
         return campaign
 
     @staticmethod
-    def _new_campaign(request: dict[str, Any], rounds: int, patience: int, constraints: dict[str, Any]) -> dict[str, Any]:
+    def _new_campaign(request: dict[str, Any], rounds: int, patience: int, constraints: dict[str, Any],
+                      scenario: dict[str, Any] | None) -> dict[str, Any]:
+        scenario = scenario or get_scenario(None)
         return {
             "id": str(uuid.uuid4()), "status": "measuring", "baseline_id": None,
             "baseline_design": None, "baseline_metrics": None, "trace": "live",
-            "goal": request.get("goal", "Minimize p99 TTFT without reducing throughput"),
+            "scenario": {k: scenario[k] for k in ("id", "title", "problem")},
+            "objective": OBJECTIVES[request.get("objective") or scenario["objective"]],
+            "workload": dict(scenario["workload"]),
+            "live": {"phase": "measure", "requests": [], "samples": [], "tokens": 0, "elapsed_s": 0.0, "concurrency": 0},
+            "calls": [],
+            "goal": request.get("goal") or scenario["goal"],
             "max_rounds": rounds, "early_stop_patience": patience, "constraints": constraints,
             "attempts": [], "events": [], "best_attempt": None, "latest_design": None,
             "telemetry": None, "calibration": None, "activity": "Measuring the live workload",
@@ -397,9 +412,9 @@ class CampaignOrchestrator:
     async def _prepare_and_run(self, campaign: dict[str, Any], request: dict[str, Any]) -> None:
         try:
             self._activity(campaign, "Measuring the live workload on Trainium")
-            telemetry = await asyncio.to_thread(self._measure)
+            telemetry = await asyncio.to_thread(self._measure, campaign.get("live"))
             self._activity(campaign, "Calibrating the simulator to the measurements")
-            calibration, trace, design = self._calibrate(telemetry)
+            calibration, trace, design = self._calibrate(telemetry, campaign.get("workload"))
             result = await self._evaluate(design, trace)
         except Exception as exc:
             campaign["status"] = "failed"
@@ -408,13 +423,25 @@ class CampaignOrchestrator:
             return
         self._live_traces[campaign["id"]] = trace
         design_data, metrics = _plain(design), _plain(result)
+        self._apply_guards(campaign["constraints"], metrics)
         campaign.update(telemetry=telemetry, calibration=calibration, baseline_design=design_data,
                         baseline_metrics=metrics, latest_design=design_data,
-                        baseline_checks=self._checks(metrics, design_data, None, campaign["constraints"]))
+                        baseline_checks=self._checks(metrics, design_data, metrics.get("throughput_tokens_s"),
+                                                     campaign["constraints"]))
+        if campaign.get("live"):
+            campaign["live"]["phase"] = "design"
         self._emit(campaign, "baseline.measured", {"calibration": calibration})
         await self._run_campaign(campaign, request)
 
-    def _measure(self) -> dict[str, Any]:
+    @staticmethod
+    def _apply_guards(constraints: dict[str, Any], baseline_metrics: Any) -> None:
+        """Turn relative guards (e.g. 'no worse than today') into absolute limits."""
+        ceiling = constraints.get("latency_ceiling")
+        p99 = _get(baseline_metrics, "ttft_p99_ms")
+        if ceiling is not None and p99 is not None and "max_p99_ttft_ms" not in constraints:
+            constraints["max_p99_ttft_ms"] = round(float(p99) * float(ceiling), 3)
+
+    def _measure(self, live: dict[str, Any] | None = None) -> dict[str, Any]:
         """Replay a burst on the live server; every source degrades to a stated reason."""
         from .telemetry import measure_live_workload, read_system_trace
 
@@ -429,14 +456,15 @@ class CampaignOrchestrator:
             return measure_live_workload(
                 base_url, os.getenv("ACCELTWIN_VLLM_METRICS_URL", "http://127.0.0.1:8000/metrics"),
                 getattr(self.proposer, "model", None) or "", requests=int(os.getenv("ACCELTWIN_REPLAY_REQUESTS", "8")),
-                concurrency=int(os.getenv("ACCELTWIN_REPLAY_CONCURRENCY", "4")))
+                concurrency=int(os.getenv("ACCELTWIN_REPLAY_CONCURRENCY", "4")), live=live)
         except Exception as exc:
             return {"vllm": {"available": False, "reason": f"{exc.__class__.__name__}: {exc}"[:200]},
                     "neuron_monitor": {"available": False, "reason": "not sampled"},
                     "system_trace": read_system_trace()}
 
-    def _calibrate(self, telemetry: dict[str, Any]) -> tuple[dict[str, Any], Any, Any]:
-        """Fit the simulator to the measurements and build the evaluation trace from them."""
+    def _calibrate(self, telemetry: dict[str, Any], workload: dict[str, Any] | None = None) -> tuple[dict[str, Any], Any, Any]:
+        """Fit the simulator to the measurements and build the scenario's evaluation trace from them."""
+        workload = {"prompt_scale": 1.0, "output_scale": 1.0, "load": 0.8, **(workload or {})}
         from .models import RequestSpec, RequestTrace
 
         vllm = telemetry.get("vllm") or {}
@@ -454,9 +482,7 @@ class CampaignOrchestrator:
                        "generation_tokens": round(vllm.get("generation_tokens_mean") or 128),
                        "model_weights_gb": weights_gb, "trace": "live" if live else "C"}
         sim = self.simulator
-        if not live or not callable(getattr(sim, "_roofline", None)):
-            if hasattr(sim, "calibration"):
-                sim.calibration = {k: calibration[k] for k in ("prefill_scale", "decode_scale", "spill_fraction")}
+        if not callable(getattr(sim, "_roofline", None)):
             return calibration, self._trace("C"), design
 
         clamp = lambda value: float(min(100.0, max(0.02, value)))
@@ -465,26 +491,36 @@ class CampaignOrchestrator:
         sim._active_topology = sim._topology_profile()
         modeled_prefill = max(sim._roofline(calibration["prompt_tokens"]))
         modeled_decode = max(sim._roofline(None))
-        if vllm.get("prefill_ms"):
+        if live and vllm.get("prefill_ms"):
             calibration["prefill_scale"] = round(clamp(vllm["prefill_ms"] / modeled_prefill), 4)
-        if vllm.get("inter_token_ms"):
+        if live and vllm.get("inter_token_ms"):
             calibration["decode_scale"] = round(clamp(vllm["inter_token_ms"] / modeled_decode), 4)
         sim.calibration = {k: calibration[k] for k in ("prefill_scale", "decode_scale", "spill_fraction")}
+        # Reshape the measured workload for the scenario (e.g. 4x longer prompts).
+        calibration["measured_prompt_tokens"] = calibration["prompt_tokens"]
+        calibration["measured_generation_tokens"] = calibration["generation_tokens"]
+        calibration["prompt_tokens"] = max(1, round(calibration["prompt_tokens"] * float(workload["prompt_scale"])))
+        calibration["generation_tokens"] = max(1, round(calibration["generation_tokens"] * float(workload["output_scale"])))
+        modeled_prefill = max(sim._roofline(calibration["prompt_tokens"]))
+        calibration["trace"] = "live" if live else "default"
+        calibration["load"] = float(workload["load"])
         # Bursts the size of the measured replay concurrency, spaced so the baseline
-        # runs at ~80% load: requests queue inside each burst, so p99 TTFT scales
-        # smoothly with service time instead of sitting on an overload cliff.
+        # runs at the scenario's load (0.8 by default): requests queue inside each
+        # burst, so p99 TTFT scales smoothly with service time instead of sitting on
+        # an overload cliff. Loads above 1 model a saturated, throughput-bound chip.
         service_ms = (modeled_prefill * calibration["prefill_scale"]
                       + calibration["generation_tokens"] * modeled_decode * calibration["decode_scale"])
         burst = max(1, int(vllm.get("concurrency") or 4))
-        interval = round(burst * service_ms / 0.8, 3)
+        interval = round(burst * service_ms / max(float(workload["load"]), 0.05), 3)
         mix = (0.5, 1.0, 1.5, 1.0, 0.75, 1.25)
-        trace = RequestTrace(name="live", description="Bursts shaped from the measured vLLM workload", requests=[
+        trace = RequestTrace(name=calibration["trace"], description="Bursts shaped from the measured vLLM workload", requests=[
             RequestSpec(request_id=f"live-{i + 1:03d}", prompt_tokens=max(1, round(calibration["prompt_tokens"] * mix[i % 6])),
                         output_tokens=calibration["generation_tokens"], arrival_ms=(i // burst) * interval) for i in range(32)])
         calibration.update(arrival_interval_ms=interval, burst_size=burst)
         return calibration, trace, design
 
     _CHECK_LABELS = {"throughput_at_least_baseline": "Throughput ≥ baseline", "memory_fit": "Model fits in HBM",
+                     "latency_guard": "p99 TTFT no worse than today",
                      "topology_valid": "Valid layout & wiring", "power_cap": "Power", "temperature_cap": "Peak temperature",
                      "area_cap": "Die area"}
 
@@ -497,7 +533,11 @@ class CampaignOrchestrator:
         rows = []
         if baseline_throughput is not None:
             rows.append({"key": "throughput_at_least_baseline", "label": "Throughput", "value": m.get("throughput_tokens_s"),
-                         "limit": baseline_throughput, "unit": "tok/s", "op": "≥"})
+                         "limit": round(baseline_throughput * float(constraints.get("throughput_floor", 1.0)), 3),
+                         "unit": "tok/s", "op": "≥"})
+        if "max_p99_ttft_ms" in constraints:
+            rows.append({"key": "latency_guard", "label": "p99 TTFT", "value": m.get("ttft_p99_ms"),
+                         "limit": constraints["max_p99_ttft_ms"], "unit": "ms", "op": "≤"})
         rows.append({"key": "memory_fit", "label": "Memory", "value": m.get("peak_memory_gb"), "limit": d.get("hbm_gb"),
                      "unit": "GB", "op": "≤"})
         for key, metric, cap, label, unit in (("power_cap", "power_w", "max_power_w", "Power", "W"),
@@ -518,8 +558,14 @@ class CampaignOrchestrator:
         campaign["status"] = "running"
         baseline_metrics = campaign["baseline_metrics"]
         baseline_throughput = self._metric(baseline_metrics, "throughput_tokens_s", "throughput_tokens_per_sec")
-        baseline_p99 = self._metric(baseline_metrics, "ttft_p99_ms", "predicted_p99_ttft_ms")
-        best_p99 = baseline_p99
+        objective = campaign.get("objective") or OBJECTIVES["ttft"]
+        campaign.setdefault("objective", objective)
+        self._apply_guards(campaign["constraints"], baseline_metrics)
+        # An infeasible starting chip (e.g. over a tighter budget) is not a bar to
+        # beat: the first design that passes every check becomes the best.
+        baseline_gates = self._gate_results(baseline_metrics, baseline_throughput, campaign["constraints"])
+        campaign["baseline_feasible"] = all(baseline_gates.values())
+        best_p99 = self._metric(baseline_metrics, objective["metric"]) if campaign["baseline_feasible"] else None
         best_design = campaign["baseline_design"]
         best_metrics = baseline_metrics
         history: list[dict[str, Any]] = []
@@ -542,6 +588,9 @@ class CampaignOrchestrator:
                 "baseline_design": campaign.get("baseline_design", {}),
                 "report": lambda text: self._activity(campaign, text),
                 "signals": self._signals(campaign),
+                "objective": objective,
+                "workload": campaign.get("calibration"),
+                "log_call": lambda entry: self._log_call(campaign, entry),
             }
             raw: dict[str, Any] = {}
             if callable(getattr(self.proposer, "design_round", None)):
@@ -638,9 +687,12 @@ class CampaignOrchestrator:
                                        topology_required=self._has_topology(design, metrics),
                                        topology_errors=topology_errors)
             p99 = self._metric(metrics, "ttft_p99_ms", "predicted_p99_ttft_ms")
+            score = self._metric(metrics, objective["metric"])
             accepted = all(gates.values())
             # Require a real gain so simulator noise never counts as progress.
-            improved = accepted and (best_p99 is None or p99 is not None and p99 < best_p99 * (1 - MIN_IMPROVEMENT))
+            improved = accepted and score is not None and (best_p99 is None or (
+                score < best_p99 * (1 - MIN_IMPROVEMENT) if objective["direction"] == "min"
+                else score > best_p99 * (1 + MIN_IMPROVEMENT)))
             attempt_id = self._save_result(result, design)
             attempt = {
                 "id": attempt_id, "round": round_no,
@@ -654,7 +706,7 @@ class CampaignOrchestrator:
                 "design_diff": design_diff,
                 "baseline_design_diff": self._design_diff(campaign.get("baseline_design", {}), design_data),
                 "feedback": self._feedback(gates, metrics, baseline_throughput, best_p99, topology_errors,
-                                           design=design_data, constraints=campaign["constraints"]),
+                                           design=design_data, constraints=campaign["constraints"], objective=objective),
                 "checks": self._checks(metrics, design_data, baseline_throughput, campaign["constraints"]),
                 "previous_boxes": self._previous_boxes(best_design, changed_ids),
                 "baseline_deltas": self._change_summary(campaign.get("baseline_design") or {}, design_data)[0],
@@ -664,16 +716,16 @@ class CampaignOrchestrator:
             self._emit(campaign, "design.evaluated", attempt)
             failed = [gate for gate, passed in gates.items() if not passed]
             history.append({"round": round_no, "name": attempt["name"], "changes": changes,
-                            "outcome": (f"p99 {p99:g} ms, " if p99 is not None else "")
+                            "outcome": (f"{objective['short']} {score:g} {objective['unit']}, " if score is not None else "")
                             + ("rejected: " + ", ".join(failed) if failed
                                else "new best" if improved else "passed but not better")})
             if improved:
-                best_p99 = p99
+                best_p99 = score
                 best_design = design_data
                 best_metrics = metrics
                 campaign["best_attempt"] = attempt
                 stale_rounds = 0
-                self._emit(campaign, "campaign.best_updated", {"attempt_id": attempt_id, "p99_ttft_ms": p99,
+                self._emit(campaign, "campaign.best_updated", {"attempt_id": attempt_id, objective["metric"]: score,
                             "design": design_data, "design_diff": attempt["design_diff"],
                             "baseline_design_diff": attempt["baseline_design_diff"]})
             else:
@@ -742,10 +794,14 @@ class CampaignOrchestrator:
                 vals = [v for row in grid if isinstance(row, list) for v in row if isinstance(v, (int, float))]
                 temp = max(vals) if vals else None
         area = cls._metric(metrics, "area_mm2", "area")
+        floor = float(constraints.get("throughput_floor", 1.0))
         gates = {
-            "throughput_at_least_baseline": throughput is not None and (baseline_throughput is None or throughput >= baseline_throughput),
+            "throughput_at_least_baseline": throughput is not None and (baseline_throughput is None or throughput >= baseline_throughput * floor - 1e-9),
             "memory_fit": bool(memory_fit),
         }
+        if "max_p99_ttft_ms" in constraints:
+            p99 = cls._metric(metrics, "ttft_p99_ms", "predicted_p99_ttft_ms")
+            gates["latency_guard"] = p99 is not None and p99 <= float(constraints["max_p99_ttft_ms"]) * (1 + 1e-9)
         if topology_required:
             reported_topology_valid = _get(metrics, "topology_valid", default=not topology_errors)
             gates["topology_valid"] = bool(reported_topology_valid) and not bool(topology_errors)
@@ -798,7 +854,8 @@ class CampaignOrchestrator:
     @classmethod
     def _feedback(cls, gates: dict[str, bool], metrics: Any, baseline_throughput: float | None,
                   best_p99: float | None, topology_errors: list[str] | None = None,
-                  design: dict[str, Any] | None = None, constraints: dict[str, Any] | None = None) -> str:
+                  design: dict[str, Any] | None = None, constraints: dict[str, Any] | None = None,
+                  objective: dict[str, Any] | None = None) -> str:
         issues = [key for key, passed in gates.items() if not passed]
         details = list(topology_errors or [])
         disconnected = _get(metrics, "disconnected_component_ids", "disconnected_components", default=[])
@@ -823,6 +880,10 @@ class CampaignOrchestrator:
                        if float(value) >= hottest - 0.5]
             details.append(f"Hottest component IDs ({hottest:g} °C): " + ", ".join(hot_ids))
         diagnosis = cls._diagnosis(gates, metrics, design or {}, constraints or {}) if design else []
+        if objective and objective.get("metric") == "area_mm2" and design:
+            # Latency advice ("raise HBM bandwidth") would push an area search the wrong way.
+            diagnosis = [d.replace("raise HBM bandwidth, HBM-to-compute link capacity, or SRAM to cut spills",
+                                   "compute cores and TFLOPS are slack and can be cut to save area") for d in diagnosis]
         if issues:
             prefix = "Hard gate failure: " + ", ".join(issues)
             details = diagnosis[:3] + details
@@ -835,6 +896,8 @@ class CampaignOrchestrator:
                 actions.append("increase HBM capacity or reduce model/KV allocation")
             if "throughput_at_least_baseline" in issues:
                 actions.append("increase the active compute or memory-bandwidth path")
+            if "latency_guard" in issues:
+                actions.append("keep p99 TTFT at or below today's: restore HBM bandwidth or compute on the bound phase")
             if "temperature_cap" in issues or "power_cap" in issues:
                 actions.append("reduce hotspot activity or improve cooling without violating other caps")
             if "area_cap" in issues:
@@ -842,6 +905,14 @@ class CampaignOrchestrator:
             return prefix + (". Next round: " + "; ".join(actions) + "." if actions else "")
         p99 = cls._metric(metrics, "ttft_p99_ms", "predicted_p99_ttft_ms")
         tail = (" " + " ".join(diagnosis[-2:])) if diagnosis else ""
+        if objective and objective.get("metric") != "ttft_p99_ms":
+            value = cls._metric(metrics, objective["metric"])
+            worse = value is not None and best_p99 is not None and (
+                value >= best_p99 if objective["direction"] == "min" else value <= best_p99)
+            if worse:
+                return (f"All hard gates pass; {objective['short']} ({value:g} {objective['unit']}) did not beat the best "
+                        f"({best_p99:g} {objective['unit']}).{tail}")
+            return f"All hard gates pass; candidate improves {objective['label']}.{tail}"
         if p99 is not None and best_p99 is not None and p99 >= best_p99:
             return f"All hard gates pass; p99 TTFT ({p99:g} ms) did not improve on best ({best_p99:g} ms).{tail}"
         return f"All hard gates pass; candidate improves predicted p99 TTFT.{tail}"
@@ -861,6 +932,13 @@ class CampaignOrchestrator:
             f"Checker feedback: {json.dumps(campaign['attempts'][-1].get('feedback') if campaign['attempts'] else None)}. "
             "Return a complete corrected graph with every connection endpoint referencing an existing component ID."
         )
+
+    @staticmethod
+    def _log_call(campaign: dict[str, Any], entry: dict[str, Any]) -> None:
+        """Keep the most recent model calls (mutated in place as they stream) for the live view."""
+        calls = campaign.setdefault("calls", [])
+        calls.append(entry)
+        del calls[:-40]
 
     def _activity(self, campaign: dict[str, Any], text: str) -> None:
         campaign["activity"] = text
