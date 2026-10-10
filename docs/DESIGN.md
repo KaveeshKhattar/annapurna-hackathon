@@ -2,22 +2,26 @@
 
 ## Product statement
 
-AccelTwin is a checker-driven agent that explores simplified AI-accelerator
-hardware configurations for one fixed inference stack. It answers a bounded
-counterfactual question: which change to compute, HBM, on-chip buffer, DMA, or
-cooling most reduces p99 time-to-first-token for the same model, software, and
-request trace?
+AccelTwin is a chip-builder AI: it proposes complete accelerator component
+graphs and floorplans for one fixed inference stack, then submits each proposed
+chip to a deterministic checker. It answers a bounded counterfactual question:
+which connected physical arrangement and resource mix most reduces p99
+time-to-first-token for the same model, software, and request trace?
 
 This is an architectural exploration prototype. It does not replace RTL,
 physical design, timing closure, power sign-off, or thermal validation.
 
 ## Demo output
 
-The user sees a Trainium2-like baseline, live or mocked serving observations, an
-animated 8x8 thermal model, a causal TTFT waterfall, and up to five agent-proposed
-design attempts. Every attempt includes:
+The user sees the actual Trainium2-like baseline component graph, live or mocked
+serving observations, an animated thermal model, a causal TTFT waterfall, and up
+to five agent-proposed chip graphs. Each proposal is the full floorplan, not a
+scalar patch. Every attempt includes:
 
 - the complete structured hardware design;
+- components with positions, dimensions, layers, and resource values, plus
+  connections with endpoint IDs and bandwidth;
+- a causal graph diff showing moved/added/removed blocks and changed links;
 - the agent rationale;
 - p50, p95, and p99 TTFT;
 - throughput, memory use, power proxy, temperature grid, throttling, and area
@@ -40,6 +44,7 @@ space contains only these typed fields:
 - DMA engine count;
 - power and cooling limits;
 - model and KV-memory assumptions used by the checker.
+- compute, HBM, SBUF, DMA, and NoC placement and interconnect paths.
 
 The baseline mirrors the hackathon-visible device: four logical NeuronCores,
 96 GB of HBM, and 2.9 TB/s HBM bandwidth. This is a simplified public
@@ -87,10 +92,16 @@ Hard gates:
 3. estimated power is below the configured cap;
 4. modeled peak junction temperature is below the configured cap;
 5. modeled area proxy is below the configured cap;
-6. values pass the `HardwareDesign` schema.
+6. values pass the `HardwareDesign` schema and every component/link topology
+   check, including floorplan bounds, same-layer overlap, resource-total
+   consistency, valid connection endpoints, and compute-to-HBM reachability.
 
-The checker—not the LLM—owns acceptance. The agent proposes exactly one design
-per round. Responses must be strict JSON. Invalid output gets one repair attempt;
+The checker—not the LLM—owns acceptance. The agent proposes exactly one complete
+design graph per round. The graph and causal diff are included in proposal,
+evaluation, and best-candidate events so the renderer can show the model's actual
+chip. Checker feedback carries exact topology violations, disconnected IDs, and
+resource, thermal, and bandwidth bottlenecks into the next prompt. Responses
+must be strict JSON. Invalid output gets one repair attempt;
 duplicate designs are rejected without another simulation. The campaign stops
 after at most five rounds, when a target is achieved, or after the configured
 number of stale rounds.
@@ -145,7 +156,7 @@ demo failure modes and makes the application easy to copy into the assigned pod.
 
 - Unavailable vLLM metrics: continue with a clearly modeled baseline.
 - Unavailable proposer endpoint in auto mode: use the deterministic bounded
-  proposer so the demo completes.
+  chip-graph proposer so the demo completes with topology-aware edits.
 - Invalid proposal: perform one repair; strict mode fails the campaign if repair
   also fails.
 - Candidate simulation failure: record feedback and continue to the next round.

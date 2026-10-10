@@ -106,10 +106,93 @@ class LLMClient:
 
     @staticmethod
     def _rule_proposal(context: dict[str, Any]) -> dict[str, Any]:
-        """Deterministic demo proposer; progressively changes one safe tuning knob."""
+        """Deterministic offline chip builder with explicit, round-varying graphs."""
         round_index = int(context.get("round", 0))
-        baseline_config = dict(context.get("baseline_config") or {})
+        baseline_config = dict(context.get("current_design") or context.get("baseline_config") or {})
         config = dict(baseline_config)
+        components = config.get("components")
+        connections = config.get("connections")
+        if isinstance(components, list) and isinstance(connections, list) and components:
+            components = [dict(component) for component in components]
+            connections = [dict(connection) for connection in connections]
+            by_type = lambda *names: [c for c in components if str(c.get("type", "")).lower() in names]
+            compute = by_type("compute", "compute_cluster", "core", "cores")
+            hbm = by_type("hbm", "memory", "hbm_stack")
+            sram = by_type("sram", "sbuf", "buffer")
+            noc = by_type("noc", "interconnect", "network")
+            def shift_one(candidates: list[dict[str, Any]], axis: str, direction: float) -> bool:
+                """Apply a small normalized move only when bounds and spacing hold."""
+                for component in candidates:
+                    old = float(component.get(axis, 0.0))
+                    extent = float(component.get("width" if axis == "x" else "height", 0.0))
+                    for delta in (direction * 0.035, -direction * 0.035, direction * 0.02, -direction * 0.02):
+                        new = old + delta
+                        if new < 0 or new + extent > 1:
+                            continue
+                        trial = dict(component)
+                        trial[axis] = new
+                        overlaps = False
+                        candidate_is_overlay = str(component.get("type", "")).lower() in {"noc", "router"}
+                        for other in components:
+                            if candidate_is_overlay or other is component or str(other.get("type", "")).lower() in {"noc", "router"}:
+                                continue
+                            if str(other.get("layer", "default")) != str(component.get("layer", "default")):
+                                continue
+                            ax = new if axis == "x" else float(component.get("x", 0.0))
+                            ay = new if axis == "y" else float(component.get("y", 0.0))
+                            aw = extent if axis == "x" else float(component.get("width", 0.0))
+                            ah = extent if axis == "y" else float(component.get("height", 0.0))
+                            ox, oy = float(other.get("x", 0.0)), float(other.get("y", 0.0))
+                            ow, oh = float(other.get("width", 0.0)), float(other.get("height", 0.0))
+                            if min(ax + aw, ox + ow) - max(ax, ox) > 0.015 and min(ay + ah, oy + oh) - max(ay, oy) > 0.015:
+                                overlaps = True
+                                break
+                        if not overlaps:
+                            component[axis] = round(new, 4)
+                            return True
+                return False
+            # Use bounded, graph-preserving physical edits. Layout nudges remain
+            # within common 0..100 floorplan coordinates and do not alter totals.
+            action = round_index % 5
+            if action == 0 and hbm:
+                shift_one(hbm, "x", 1 if round_index % 2 == 0 else -1)
+                bandwidth_scale = 1.20
+                if "hbm_bandwidth_tb_s" in config:
+                    config["hbm_bandwidth_tb_s"] = round(float(config["hbm_bandwidth_tb_s"]) * bandwidth_scale, 4)
+                for component in hbm:
+                    component["bandwidth_tb_s"] = round(float(component.get("bandwidth_tb_s", 0)) * bandwidth_scale, 4)
+                for connection in connections:
+                    connection["bandwidth_tb_s"] = round(float(connection.get("bandwidth_tb_s", .01)) * bandwidth_scale, 4)
+                if "utilization" in config:
+                    config["utilization"] = min(.95, round(float(config.get("utilization", .72)) + .05, 3))
+                rationale = "Widen the memory fabric and HBM interfaces by 20%, reposition the HBM stack, and raise useful compute utilization to relieve the decode bandwidth bottleneck."
+            elif action == 1 and compute:
+                # Separate existing clusters to spread heat and expose their
+                # distinct placement to the live chip renderer.
+                shift_one(compute, "y", -1 if round_index % 2 == 1 else 1)
+                rationale = "Shift a compute cluster to explore a cooler physical placement while preserving the graph."
+            elif action == 2 and (noc or connections):
+                if noc:
+                    shift_one(noc, "x", 1 if round_index % 2 == 0 else -1)
+                else:
+                    shift_one(compute or hbm or components, "x", 1 if round_index % 2 == 0 else -1)
+                rationale = "Shift the interconnect region to improve physical locality while preserving link capacity."
+            elif action == 3 and sram:
+                shift_one(sram, "x", -1 if round_index % 2 == 1 else 1)
+                rationale = "Move the on-chip buffer closer to compute to shorten local data movement."
+            elif hbm or compute:
+                shift_one(hbm + compute, "y", 1 if round_index % 2 == 0 else -1)
+                rationale = "Rebalance memory and compute placement to improve locality without changing resources."
+            else:
+                # Even minimal schemas produce a visible graph change.
+                first = components[0]
+                shift_one([first], "x", 1 if round_index % 2 == 0 else -1)
+                rationale = "Reposition the first functional block to explore a distinct physical floorplan."
+            config["components"] = components
+            config["connections"] = connections
+            return {"name": f"offline chip layout {round_index + 1}", "rationale": rationale, "design": config}
+
+        # Compatibility for scalar-only models/callers during migration.
         # These knobs are illustrative defaults. The simulator owns allowed ranges and
         # the orchestration layer subjects every candidate to its hard gates.
         knobs = ("utilization", "hbm_bandwidth_tb_s", "peak_compute_tflops", "sbuf_gb", "dma_engines")
@@ -126,7 +209,7 @@ class LLMClient:
         else:
             config[knob] = min(16, int(current or 4) + 1)
         return {
-            "name": f"rule-based candidate {round_index + 1}",
+            "name": f"offline architecture candidate {round_index + 1}",
             "rationale": f"Explore a bounded increase to {knob}; hard gates remain authoritative.",
             "design": config,
         }

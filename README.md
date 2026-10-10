@@ -1,9 +1,11 @@
-# AccelTwin
+# Chip Builder AI (AccelTwin)
 
-AccelTwin is a trace-guided accelerator design agent for AWS Trainium. It observes
-a fixed LLM inference workload, builds a calibrated digital twin, proposes bounded
-hardware changes, rejects invalid designs, and renders each iteration as an
-animated chip floorplan.
+Chip Builder AI is an agent that designs accelerator architectures for a real LLM
+workload. On every round, the locally hosted LLM returns a complete, structured
+chip proposal: compute clusters, HBM stacks, on-chip SRAM, DMA engines, NoC,
+connections, bandwidths, and physical placement. The application renders that
+exact proposal as the central artifact, checks it, simulates it, and sends concrete
+failures or bottlenecks back to the model for the next design.
 
 The central demo question is deliberately concrete:
 
@@ -11,23 +13,21 @@ The central demo question is deliberately concrete:
 > most improves p99 time-to-first-token without sacrificing throughput or crossing
 > memory, power, temperature, or area limits?
 
-AccelTwin is a counterfactual design tool, not a claim that software telemetry can
-perfectly predict unbuilt silicon. Measured values are labeled **MEASURED**;
-calibrated and counterfactual values are labeled **MODELED**.
+This is rapid architecture exploration, not fabrication-ready chip design. It does
+not generate RTL, complete place-and-route, timing closure, or sign-off. Measured
+values are labeled **MEASURED**; simulated values are labeled **MODELED**.
 
 ## What the demo does
 
-1. Captures a baseline from vLLM's Prometheus endpoint, with an offline fallback.
-2. Replays deterministic calibration and bursty evaluation traces.
-3. Fits a small phase-aware model for queueing, prefill, decode, memory, power, and
-   an 8x8 thermal grid.
-4. Calls a locally served OpenAI-compatible LLM to propose one structured hardware
-   design at a time. If the model is unavailable, a deterministic proposer keeps
-   the demo runnable.
-5. Scores every design against hard feasibility gates and streams progress to the
-   browser.
-6. Produces an animated before/after die, latency waterfall, attempt history, and a
-   Markdown decision report.
+1. Starts from a Trainium2-like baseline graph sized for the assigned 96 GB device.
+2. Captures the fixed LLM workload from vLLM Prometheus, with an offline fallback.
+3. Asks a locally served LLM to build one complete hardware graph and floorplan.
+4. Validates physical bounds, overlap, resource totals, endpoints, and every
+   compute-to-memory path before simulation.
+5. Simulates topology-aware queueing, prefill, decode, bandwidth, power, placement,
+   and temperature; the checker sends actionable findings into the next round.
+6. Streams each exact model-authored design into an interactive SVG chip view and
+   finishes on the best feasible architecture with a downloadable decision report.
 
 ## Quick start
 
@@ -54,7 +54,7 @@ cp .env.example .env
 uvicorn app.api:app --host 0.0.0.0 --port 8080
 ```
 
-Open port `8080`, click **Capture baseline**, then **Start optimization**.
+Open port `8080`, enter a design brief, then click **Build and test chip**.
 
 ### Offline/local demo
 
@@ -82,11 +82,11 @@ app/
   api.py            FastAPI endpoints and static UI hosting
   orchestrator.py   bounded propose-check-score loop
   llm_client.py     structured local-LLM and deterministic proposers
-  simulator.py      trace replay and calibrated digital twin
+  simulator.py      graph-aware workload, physical, power, and thermal checker
   telemetry.py      vLLM/Neuron observation adapters
   storage.py        SQLite and JSONL persistence
   report.py         decision report generation
-  static/           animated dashboard
+  static/           exact component-graph and floorplan renderer
 tests/               deterministic unit and API tests
 k8s/                 pod-side deployment manifest
 ```
@@ -107,12 +107,14 @@ shows which bottleneck caused the result.
 
 ## Demo script
 
-1. Show the live Trainium model responding.
-2. Capture a baseline and point out the **MEASURED** badge.
-3. Start optimization; watch the agent alter HBM bandwidth, compute, SRAM, and
-   cooling while the thermal map and latency waterfall respond.
-4. Open a rejected attempt to show that the checker, not the LLM, owns feasibility.
-5. Finish on the winning design and download the report.
+1. Show the locally hosted LLM responding on Trainium.
+2. Enter a brief such as “minimize p99 TTFT without reducing throughput.”
+3. Click **Build and test chip**. The first full component graph appears immediately.
+4. Watch blocks, links, bandwidths, and placement change after checker feedback;
+   click any component to inspect the model-authored values and live simulation.
+5. Open a rejected proposal to show that the checker—not the LLM—owns feasibility.
+6. Finish on the highlighted best chip and its p99, throughput, power, temperature,
+   area, topology validation, design diff, and downloadable report.
 
 For a reliable stage demo, run the flow once beforehand so model weights and
 Neuron compilation artifacts are warm.

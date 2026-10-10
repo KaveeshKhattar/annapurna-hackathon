@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -82,6 +83,48 @@ class CampaignOrchestrator:
         if hasattr(model, "model_validate"):
             return model.model_validate(data)
         return model.parse_obj(data)
+
+    @staticmethod
+    def _topology_errors(design: Any, metrics: Any = None) -> list[str]:
+        """Return structural errors from both the design model and checker."""
+        errors: list[str] = []
+        validator = getattr(design, "validate_topology", None)
+        if callable(validator):
+            try:
+                errors.extend(str(error) for error in (validator() or []))
+            except Exception as exc:
+                errors.append(f"topology validation failed: {exc}")
+        metric_errors = _get(metrics, "topology_errors", "topology_violations", default=[])
+        if isinstance(metric_errors, str):
+            metric_errors = [metric_errors]
+        if isinstance(metric_errors, (list, tuple)):
+            errors.extend(str(error) for error in metric_errors)
+        return list(dict.fromkeys(errors))
+
+    @staticmethod
+    def _has_topology(design: Any, metrics: Any = None) -> bool:
+        return (_get(design, "components") is not None or _get(design, "connections") is not None
+                or _get(metrics, "topology_valid") is not None)
+
+    @staticmethod
+    def _design_diff(previous: Any, current: Any) -> dict[str, Any]:
+        """Explain what physically changed between two complete design graphs."""
+        before, after = _plain(previous) or {}, _plain(current) or {}
+        keys = set(before) | set(after)
+        scalar_changes = {key: {"from": before.get(key), "to": after.get(key)}
+                          for key in sorted(keys - {"components", "connections"})
+                          if before.get(key) != after.get(key)}
+        def indexed(items: Any) -> dict[str, Any]:
+            return {str(item.get("id")): item for item in items or [] if isinstance(item, dict) and item.get("id") is not None}
+        old_components, new_components = indexed(before.get("components")), indexed(after.get("components"))
+        old_connections, new_connections = indexed(before.get("connections")), indexed(after.get("connections"))
+        def changes(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+            return {"added": [new[key] for key in sorted(new.keys() - old.keys())],
+                    "removed": [old[key] for key in sorted(old.keys() - new.keys())],
+                    "modified": [{"id": key, "from": old[key], "to": new[key]}
+                                 for key in sorted(old.keys() & new.keys()) if old[key] != new[key]]}
+        return {"scalars": scalar_changes, "components": changes(old_components, new_components),
+                "connections": changes(old_connections, new_connections)}
 
     def _default_design(self) -> Any:
         model, _ = self._models()
@@ -221,12 +264,14 @@ class CampaignOrchestrator:
             "baseline_metrics": campaign_baseline_metrics,
             "source_baseline_metrics": baseline.get("metrics", {}),
             "trace": campaign_trace,
+            "goal": request.get("goal", "Minimize p99 TTFT without reducing throughput"),
             "max_rounds": rounds,
             "early_stop_patience": patience,
             "constraints": constraints,
             "attempts": [],
             "events": [],
             "best_attempt": None,
+            "latest_design": baseline.get("design", {}),
             "created_at": time.time(),
         }
         self.campaigns[campaign_id] = campaign
@@ -251,6 +296,8 @@ class CampaignOrchestrator:
                 "baseline_config": best_design,
                 "baseline_metrics": baseline_metrics,
                 "feedback": campaign["attempts"][-1].get("feedback") if campaign["attempts"] else None,
+                "current_design": campaign.get("latest_design", best_design),
+                "baseline_design": campaign.get("baseline_design", {}),
             }
             raw: dict[str, Any] = {}
             try:
@@ -275,6 +322,9 @@ class CampaignOrchestrator:
                         return
 
             design_data = _plain(design)
+            # Canonical full-design serialization includes all component positions,
+            # dimensions, layers, and links, so a topology edit is never collapsed
+            # into a duplicate scalar configuration.
             fingerprint = json.dumps(design_data, sort_keys=True, separators=(",", ":"), default=str)
             if fingerprint in seen or fingerprint == json.dumps(best_design, sort_keys=True, separators=(",", ":"), default=str):
                 attempt = {
@@ -288,19 +338,32 @@ class CampaignOrchestrator:
                 campaign["stop_reason"] = "duplicate design"
                 break
             seen.add(fingerprint)
-            self._emit(campaign, "design.proposed", {"round": round_no, "design": design_data})
+            previous_design = campaign.get("latest_design", campaign.get("baseline_design", {}))
+            design_diff = self._design_diff(previous_design, design_data)
+            campaign["latest_design"] = design_data
+            self._emit(campaign, "design.proposed", {
+                "round": round_no,
+                "name": _get(raw, "name", default=f"candidate {round_no}"),
+                "rationale": _get(raw, "rationale", default=""),
+                "design": design_data,
+                "design_diff": design_diff,
+            })
             try:
                 result = await self._evaluate(design, self._trace(campaign["trace"]))
                 metrics = _plain(result)
             except Exception as exc:
                 attempt = {"id": str(uuid.uuid4()), "round": round_no, "design": design_data,
-                           "accepted": False, "feedback": f"Simulation failed: {exc}"}
+                           "accepted": False, "design_diff": design_diff,
+                           "feedback": f"Simulation failed: {exc}"}
                 campaign["attempts"].append(attempt)
                 self.designs[attempt["id"]] = attempt
                 self._emit(campaign, "design.evaluated", attempt)
                 continue
 
-            gates = self._gate_results(metrics, baseline_throughput, campaign["constraints"])
+            topology_errors = self._topology_errors(design, metrics)
+            gates = self._gate_results(metrics, baseline_throughput, campaign["constraints"],
+                                       topology_required=self._has_topology(design, metrics),
+                                       topology_errors=topology_errors)
             p99 = self._metric(metrics, "ttft_p99_ms", "predicted_p99_ttft_ms")
             accepted = all(gates.values())
             improved = accepted and (best_p99 is None or p99 is not None and p99 < best_p99)
@@ -311,7 +374,10 @@ class CampaignOrchestrator:
                 "rationale": _get(raw, "rationale", default=""),
                 "design": design_data, "metrics": metrics, "gate_results": gates,
                 "accepted": accepted, "improved": improved,
-                "feedback": self._feedback(gates, metrics, baseline_throughput, best_p99),
+                "topology_errors": topology_errors,
+                "design_diff": design_diff,
+                "baseline_design_diff": self._design_diff(campaign.get("baseline_design", {}), design_data),
+                "feedback": self._feedback(gates, metrics, baseline_throughput, best_p99, topology_errors),
             }
             campaign["attempts"].append(attempt)
             self.designs[attempt_id] = attempt
@@ -321,7 +387,9 @@ class CampaignOrchestrator:
                 best_design = design_data
                 campaign["best_attempt"] = attempt
                 stale_rounds = 0
-                self._emit(campaign, "campaign.best_updated", {"attempt_id": attempt_id, "p99_ttft_ms": p99})
+                self._emit(campaign, "campaign.best_updated", {"attempt_id": attempt_id, "p99_ttft_ms": p99,
+                            "design": design_data, "design_diff": attempt["design_diff"],
+                            "baseline_design_diff": attempt["baseline_design_diff"]})
             else:
                 stale_rounds += 1
             target = campaign["constraints"].get("target_p99_ttft_ms")
@@ -361,7 +429,10 @@ class CampaignOrchestrator:
                 "name": {"type": "string"}, "rationale": {"type": "string"}, "design": schema
             }, "required": ["design"], "additionalProperties": False}
         return {"type": "object", "properties": {"name": {"type": "string"}, "rationale": {"type": "string"},
-                "design": {"type": "object"}}, "required": ["design"], "additionalProperties": False}
+                "design": {"type": "object", "properties": {
+                    "components": {"type": "array", "items": {"type": "object"}},
+                    "connections": {"type": "array", "items": {"type": "object"}},
+                }, "required": ["components", "connections"]}}, "required": ["design"], "additionalProperties": False}
 
     @staticmethod
     def _metric(metrics: Any, *names: str) -> float | None:
@@ -372,7 +443,8 @@ class CampaignOrchestrator:
             return None
 
     @classmethod
-    def _gate_results(cls, metrics: Any, baseline_throughput: float | None, constraints: dict[str, Any]) -> dict[str, bool]:
+    def _gate_results(cls, metrics: Any, baseline_throughput: float | None, constraints: dict[str, Any],
+                      topology_required: bool = False, topology_errors: list[str] | None = None) -> dict[str, bool]:
         throughput = cls._metric(metrics, "throughput_tokens_s", "throughput_tokens_per_sec")
         memory_fit = _get(metrics, "memory_fit", "memory_fits", default=False)
         power = cls._metric(metrics, "power_w", "power_watts")
@@ -387,16 +459,56 @@ class CampaignOrchestrator:
             "throughput_at_least_baseline": throughput is not None and (baseline_throughput is None or throughput >= baseline_throughput),
             "memory_fit": bool(memory_fit),
         }
+        if topology_required:
+            reported_topology_valid = _get(metrics, "topology_valid", default=not topology_errors)
+            gates["topology_valid"] = bool(reported_topology_valid) and not bool(topology_errors)
         for gate, metric, cap in (("power_cap", power, "max_power_w"), ("temperature_cap", temp, "max_temperature_c"), ("area_cap", area, "max_area_mm2")):
             if cap in constraints:
                 gates[gate] = metric is not None and metric <= float(constraints[cap])
         return gates
 
     @classmethod
-    def _feedback(cls, gates: dict[str, bool], metrics: Any, baseline_throughput: float | None, best_p99: float | None) -> str:
+    def _feedback(cls, gates: dict[str, bool], metrics: Any, baseline_throughput: float | None,
+                  best_p99: float | None, topology_errors: list[str] | None = None) -> str:
         issues = [key for key, passed in gates.items() if not passed]
+        details = list(topology_errors or [])
+        disconnected = _get(metrics, "disconnected_component_ids", "disconnected_components", default=[])
+        bottlenecks = _get(metrics, "bottleneck_component_ids", "bottlenecks", default=[])
+        if not disconnected:
+            disconnected = sorted({component_id for error in details
+                                   for component_id in re.findall(r"compute component ([^ ]+) has no HBM path", error)})
+        if isinstance(disconnected, (list, tuple)) and disconnected:
+            details.append("Disconnected component IDs: " + ", ".join(map(str, disconnected)))
+        if isinstance(bottlenecks, (list, tuple)) and bottlenecks:
+            ids_text = ", ".join(map(str, bottlenecks))
+            details.append("Resource/bandwidth bottleneck component IDs: " + ids_text)
+            details.append("Inspect or widen the constrained links incident to: " + ids_text)
+        if _get(metrics, "thermal_bottleneck_component_ids"):
+            details.append("Thermal bottleneck component IDs: " + ", ".join(map(str, _get(metrics, "thermal_bottleneck_component_ids"))))
+        if _get(metrics, "bandwidth_bottleneck_component_ids"):
+            details.append("Bandwidth bottleneck component IDs: " + ", ".join(map(str, _get(metrics, "bandwidth_bottleneck_component_ids"))))
+        component_temperatures = _get(metrics, "component_temperatures", default={}) or {}
+        if isinstance(component_temperatures, dict) and component_temperatures:
+            hottest = max(float(value) for value in component_temperatures.values())
+            hot_ids = [str(component_id) for component_id, value in component_temperatures.items()
+                       if float(value) >= hottest - 0.5]
+            details.append(f"Hottest component IDs ({hottest:g} °C): " + ", ".join(hot_ids))
         if issues:
-            return "Hard gate failure: " + ", ".join(issues)
+            prefix = "Hard gate failure: " + ", ".join(issues)
+            if details:
+                prefix += ". Checker findings: " + "; ".join(details)
+            actions = []
+            if "topology_valid" in issues:
+                actions.append("repair listed topology violations, reconnect all component IDs, and preserve scalar/topology consistency")
+            if "memory_fit" in issues:
+                actions.append("increase HBM capacity or reduce model/KV allocation")
+            if "throughput_at_least_baseline" in issues:
+                actions.append("increase the active compute or memory-bandwidth path")
+            if "temperature_cap" in issues or "power_cap" in issues:
+                actions.append("reduce hotspot activity or improve cooling without violating other caps")
+            if "area_cap" in issues:
+                actions.append("reduce component count or footprint")
+            return prefix + (". Next round: " + "; ".join(actions) + "." if actions else "")
         p99 = cls._metric(metrics, "ttft_p99_ms", "predicted_p99_ttft_ms")
         if p99 is not None and best_p99 is not None and p99 >= best_p99:
             return f"All hard gates pass; p99 TTFT ({p99:g} ms) did not improve on best ({best_p99:g} ms)."
@@ -405,13 +517,17 @@ class CampaignOrchestrator:
     @staticmethod
     def _prompt(campaign: dict[str, Any], round_no: int, best_design: dict[str, Any], best_p99: float | None) -> str:
         return (
-            "Propose one feasible hardware design as strict JSON. Return fields name, rationale, and design. "
-            "The design must satisfy the model schema. The objective is lower predicted p99 TTFT, with hard gates: "
-            "throughput at least baseline, memory fit, and all specified power, temperature, and area caps. "
+            "Act as a chip-builder AI. Propose the complete physical accelerator design as strict JSON fields name, rationale, design. "
+            "Every round must provide the full components array (IDs, type, x/y, width/height, layer and relevant capacities) and "
+            "connections array (source/target IDs and bandwidth); return the entire graph, not a scalar-only patch. "
+            "Change the actual layout/topology in response to checker findings. The design must satisfy the model schema and topology validator. "
+            f"User design brief: {campaign.get('goal', 'Minimize p99 TTFT without reducing throughput')}. "
+            "Primary scored objective: lower predicted p99 TTFT. Hard gates: topology validity, throughput at least baseline, memory fit, and all specified power, temperature, and area caps. "
             f"Round {round_no} of at most {campaign['max_rounds']}. Baseline metrics: "
             f"{json.dumps(campaign['baseline_metrics'], default=str)}. Current best p99 TTFT: {best_p99}. "
-            f"Current best design: {json.dumps(best_design, default=str)}. "
-            f"Checker feedback: {json.dumps(campaign['attempts'][-1].get('feedback') if campaign['attempts'] else None)}."
+            f"Current best design: {json.dumps(best_design, default=str)}. Latest proposed design: {json.dumps(campaign.get('latest_design', best_design), default=str)}. "
+            f"Checker feedback: {json.dumps(campaign['attempts'][-1].get('feedback') if campaign['attempts'] else None)}. "
+            "Return a complete corrected graph with every connection endpoint referencing an existing component ID."
         )
 
     @staticmethod

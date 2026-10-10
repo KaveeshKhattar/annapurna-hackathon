@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app import api
 from app.llm_client import ProposalError
+from app.llm_client import LLMClient
 from app.orchestrator import CampaignOrchestrator
 
 
@@ -172,3 +173,47 @@ def test_invalid_proposal_gets_exactly_one_repair_attempt():
         assert campaign["status"] == "failed"
         assert proposer.propose_calls == 1
         assert proposer.repair_calls == 1
+
+
+def test_topology_is_a_hard_gate_and_checker_feedback_is_actionable():
+    gates = CampaignOrchestrator._gate_results(
+        {"topology_valid": False, "memory_fit": True, "throughput_tokens_s": 120,
+         "power_w": 200, "max_temperature_c": 70, "area_mm2": 500},
+        baseline_throughput=100, constraints={}, topology_required=True,
+        topology_errors=["connection c0 targets missing component ghost"],
+    )
+    assert gates["topology_valid"] is False
+    feedback = CampaignOrchestrator._feedback(
+        gates, {"topology_errors": ["connection c0 targets missing component ghost"],
+                "disconnected_component_ids": ["compute-1"],
+                "thermal_bottleneck_component_ids": ["compute-1"]},
+        baseline_throughput=100, best_p99=90,
+        topology_errors=["connection c0 targets missing component ghost"],
+    )
+    assert "missing component ghost" in feedback
+    assert "compute-1" in feedback
+    assert "reconnect all component IDs" in feedback
+
+
+def test_offline_proposer_returns_complete_changed_chip_graph():
+    source = {"compute_cores": 4, "components": [
+        {"id": "compute-0", "type": "compute_cluster", "x": 0.1, "y": 0.1,
+         "width": 0.2, "height": 0.2, "layer": "default", "core_count": 4},
+    ], "connections": []}
+    proposal = LLMClient._rule_proposal({"round": 0, "baseline_config": source})
+    assert proposal["design"]["components"]
+    assert proposal["design"]["connections"] == []
+    moved = proposal["design"]["components"][0]
+    assert (moved["x"], moved["y"]) != (source["components"][0]["x"], source["components"][0]["y"])
+    assert proposal["rationale"]
+
+
+def test_design_diff_exposes_physical_layout_and_link_changes():
+    before = {"components": [{"id": "hbm-0", "type": "hbm", "x": 0.1, "y": 0.2}],
+              "connections": [{"id": "link-0", "source": "hbm-0", "target": "compute-0"}]}
+    after = {"components": [{"id": "hbm-0", "type": "hbm", "x": 0.2, "y": 0.2}],
+             "connections": [{"id": "link-1", "source": "hbm-0", "target": "compute-1"}]}
+    diff = CampaignOrchestrator._design_diff(before, after)
+    assert diff["components"]["modified"][0]["id"] == "hbm-0"
+    assert diff["connections"]["removed"][0]["id"] == "link-0"
+    assert diff["connections"]["added"][0]["id"] == "link-1"

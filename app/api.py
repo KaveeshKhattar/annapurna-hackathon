@@ -46,6 +46,14 @@ async def health() -> dict[str, str]:
 @app.get("/api/state")
 async def state() -> dict[str, Any]:
     baseline = next(reversed(orchestrator.baselines.values()), None) if orchestrator.baselines else None
+    if baseline is None:
+        try:
+            from .models import HardwareDesign
+            initial_design = HardwareDesign.baseline().model_dump(mode="json")
+        except Exception:
+            initial_design = None
+    else:
+        initial_design = baseline.get("design")
     metrics = (baseline or {}).get("metrics", {})
     grid = metrics.get("thermal_grid", []) if isinstance(metrics, dict) else []
     flat_grid = [value for row in grid for value in row] if grid else []
@@ -58,6 +66,7 @@ async def state() -> dict[str, Any]:
         "connected": bool((baseline or {}).get("measured_telemetry")),
         "measurement_source": (baseline or {}).get("measurement_source", "modeled"),
         "baseline_id": (baseline or {}).get("id"),
+        "design": initial_design,
         "metrics": {
             **metrics,
             "p99_ttft_ms": metrics.get("ttft_p99_ms"),
