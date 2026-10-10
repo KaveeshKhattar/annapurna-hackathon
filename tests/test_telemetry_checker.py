@@ -115,3 +115,24 @@ def test_system_profile_reports_traffic_window_not_warmup():
     assert abs(summary["device_busy_pct"] - 100 * (2 * 240 + 20 * 36) / (2 * 240 + 19 * 40 + 36)) < 0.01
     assert abs(summary["collective_pct"] - 100 * 10 / (2 * 240 + 20 * 36)) < 0.01
     assert summary["hbm_used_gb"] == 24.5 and summary["spill_mb"] == 10.0
+
+
+def test_trace_splits_host_overhead_from_device_time_and_uses_measured_memory():
+    orchestrator = CampaignOrchestrator(simulator=DigitalTwinSimulator())
+    telemetry = {"vllm": {"available": True, "prefill_ms": 320.0, "inter_token_ms": 31.0, "concurrency": 4,
+                          "prompt_tokens_mean": 317, "generation_tokens_mean": 160, "model_weights_gb": 47.4},
+                 "system_trace": {"available": True, "prefill_step_ms": 244.0, "decode_step_ms": 35.6,
+                                  "collective_pct": 1.3, "hbm_used_gb": 49.7, "device_busy_pct": 99.7}}
+    calibration, trace, design = orchestrator._calibrate(telemetry)
+    assert calibration["prefill_overhead_ms"] == 76.0 and calibration["decode_overhead_ms"] == 0.0
+    assert calibration["collective_share"] == 0.013 and calibration["memory_footprint_gb"] == 49.7
+    sim = orchestrator.simulator
+    base = sim.evaluate(design, trace)
+    assert abs(sim._prefill_ms(317) - 320.0) < 1.0          # still reproduces the measured end-to-end prefill
+    assert base.peak_memory_gb < 50.0                         # measured footprint, not the 55.7 GB estimate
+    # Doubling HBM bandwidth halves only the device part of prefill, not the 76 ms of host overhead.
+    faster = design.model_copy(update={"hbm_bandwidth_tb_s": 5.8, "components": [
+        c.model_copy(update={"bandwidth_tb_s": c.bandwidth_tb_s * 2}) if c.type == "hbm" else c for c in design.components],
+        "connections": [e.model_copy(update={"bandwidth_tb_s": e.bandwidth_tb_s * 2}) for e in design.connections]})
+    sim.evaluate(faster, trace)
+    assert 160.0 < sim._prefill_ms(317) < 210.0          # without the split it would claim ~160 ms
