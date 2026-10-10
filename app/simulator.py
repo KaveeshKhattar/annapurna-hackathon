@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Dict, Iterable, List, Sequence, Union
 
 from .models import HardwareDesign, RequestOutcome, RequestSpec, RequestTrace, SimulationResult
@@ -52,27 +53,105 @@ class DigitalTwinSimulator:
     def __init__(self, design: HardwareDesign | None = None):
         self.design = design or HardwareDesign.baseline()
 
+    def _topology_profile(self):
+        """Summarize resources and the HBM-to-compute max-flow in the graph."""
+        d = self.design
+        components = d.components or []
+        edges = d.connections or []
+        compute = [c for c in components if c.type == "compute_cluster"]
+        hbm = [c for c in components if c.type == "hbm"]
+        ids = [c.id for c in components]
+        by_id = {c.id: c for c in components}
+        source, sink = "__hbm_source__", "__compute_sink__"
+        residual = {key: {} for key in ids + [source, sink]}
+        wire_lengths = []
+        for edge in edges:
+            if edge.source in residual and edge.target in residual:
+                # Connections model bidirectional physical links. Residual
+                # capacities retain that while allowing flow rerouting.
+                residual[edge.source][edge.target] = residual[edge.source].get(edge.target, 0) + edge.bandwidth_tb_s
+                residual[edge.target][edge.source] = residual[edge.target].get(edge.source, 0) + edge.bandwidth_tb_s
+                a, b = by_id[edge.source], by_id[edge.target]
+                ax, ay = a.x + a.width / 2.0, a.y + a.height / 2.0
+                bx, by = b.x + b.width / 2.0, b.y + b.height / 2.0
+                wire_lengths.append(abs(ax - bx) + abs(ay - by))
+        for comp in hbm:
+            residual[source][comp.id] = comp.bandwidth_tb_s
+        for comp in compute:
+            residual[comp.id][sink] = max(d.hbm_bandwidth_tb_s, 0.001)
+        flow = 0.0
+        while True:
+            parent = {source: None}
+            queue = deque([source])
+            while queue and sink not in parent:
+                node = queue.popleft()
+                for nxt, cap in residual[node].items():
+                    if cap > 1e-9 and nxt not in parent:
+                        parent[nxt] = node
+                        queue.append(nxt)
+            if sink not in parent:
+                break
+            amount, node = float("inf"), sink
+            while parent[node] is not None:
+                prev = parent[node]
+                amount = min(amount, residual[prev][node]); node = prev
+            node = sink
+            while parent[node] is not None:
+                prev = parent[node]
+                residual[prev][node] -= amount
+                residual[node][prev] = residual[node].get(prev, 0) + amount
+                node = prev
+            flow += amount
+        # Mean shortest graph distance approximates interconnect hop cost.
+        distances = []
+        adjacency = {key: set() for key in ids}
+        for edge in edges:
+            if edge.source in adjacency and edge.target in adjacency:
+                adjacency[edge.source].add(edge.target); adjacency[edge.target].add(edge.source)
+        for src in hbm:
+            dist = {src.id: 0}; queue = deque([src.id])
+            while queue:
+                node = queue.popleft()
+                for nxt in adjacency[node]:
+                    if nxt not in dist:
+                        dist[nxt] = dist[node] + 1; queue.append(nxt)
+            distances.extend(dist[c.id] for c in compute if c.id in dist)
+        hops = sum(distances) / len(distances) if distances else 0.0
+        return {
+            "compute_tflops": sum(c.compute_tflops for c in compute),
+            "hbm_gb": sum(c.capacity_gb for c in hbm),
+            "hbm_bandwidth": min(sum(c.bandwidth_tb_s for c in hbm), flow),
+            "sbuf_gb": sum(c.capacity_gb for c in components if c.type == "sbuf"),
+            "dma_engines": sum(c.dma_engines for c in components if c.type == "dma"),
+            "area_mm2": sum(c.area_mm2 for c in components),
+            "hops": hops,
+            "wire_length": sum(wire_lengths) / len(wire_lengths) if wire_lengths else 0.0,
+            "flow": flow,
+        }
+
     def _prefill_ms(self, prompt_tokens: int) -> float:
         d = self.design
+        topology = getattr(self, "_active_topology", None) or self._topology_profile()
         params = d.model_size_b * 1e9
         # Attention makes prefill work grow faster than a linear token pass.
         flops = 2.0 * params * prompt_tokens * (1.0 + min(prompt_tokens, 8192) / 4096.0)
-        compute_ms = flops / (d.peak_compute_tflops * 1e12 * d.utilization) * 1000.0
+        compute_ms = flops / (topology["compute_tflops"] * 1e12 * d.utilization) * 1000.0
         # A streaming weight pass plus activation traffic; bytes and bandwidth
         # use decimal units so the stated 2.9 TB/s baseline is literal.
         bytes_moved = params * d.weight_bytes_per_parameter + prompt_tokens * 4096.0
-        memory_ms = bytes_moved / (d.hbm_bandwidth_tb_s * 1e12) * 1000.0
-        return max(compute_ms, memory_ms, 0.05)
+        memory_ms = bytes_moved / (topology["hbm_bandwidth"] * 1e12) * 1000.0
+        return max(compute_ms, memory_ms, 0.05) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04
 
     def _decode_token_ms(self, concurrent: int = 1) -> float:
         d = self.design
+        topology = getattr(self, "_active_topology", None) or self._topology_profile()
         params = d.model_size_b * 1e9
         flops = 2.0 * params
-        compute_ms = flops / (d.peak_compute_tflops * 1e12 * d.utilization) * 1000.0
+        compute_ms = flops / (topology["compute_tflops"] * 1e12 * d.utilization) * 1000.0
         # Each step streams weights once and reads per-sequence KV state.
         bytes_moved = params * d.weight_bytes_per_parameter + concurrent * 4096.0
-        memory_ms = bytes_moved / (d.hbm_bandwidth_tb_s * 1e12) * 1000.0
-        return max(compute_ms, memory_ms, 0.01)
+        memory_ms = bytes_moved / (topology["hbm_bandwidth"] * 1e12) * 1000.0
+        return max(compute_ms, memory_ms, 0.01) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04
 
     def evaluate(
         self,
@@ -92,6 +171,13 @@ class DigitalTwinSimulator:
             return self._empty_result(workload.name)
 
         d = self.design
+        topology_errors = d.validate_topology()
+        topology = self._topology_profile()
+        if topology_errors:
+            return self._invalid_result(workload.name, topology_errors)
+        # Use the topology-derived totals throughout the replay. A topology
+        # edit therefore changes simulated performance and resource fit.
+        self._active_topology = topology
         raw_power = 85.0 + d.utilization * min(d.peak_compute_tflops / 2500.0, 1.8) * 420.0
         power_cap = min(d.power_limit_w, d.cooling_capacity_w)
         throttling = raw_power > power_cap
@@ -101,8 +187,8 @@ class DigitalTwinSimulator:
         # allocation, and a fixed work-buffer allowance.
         weight_gb = d.model_size_b * 1e9 * d.weight_bytes_per_parameter / 1e9
         max_kv_gb = max((r.prompt_tokens + r.output_tokens) * d.kv_bytes_per_token for r in workload.requests)
-        peak_memory = weight_gb + max_kv_gb + min(d.sbuf_gb, 8.0)
-        memory_fit = peak_memory <= d.hbm_gb
+        peak_memory = weight_gb + max_kv_gb + min(topology["sbuf_gb"], 8.0)
+        memory_fit = peak_memory <= topology["hbm_gb"]
 
         # FCFS queue replay: requests are admitted by arrival time, then each
         # receives a prefill phase followed by serial autoregressive decode.
@@ -133,7 +219,7 @@ class DigitalTwinSimulator:
 
         # Coarse package-area proxy used only as a transparent architectural
         # constraint. It is not a physical-design estimate.
-        area_mm2 = (
+        area_mm2 = topology["area_mm2"] or (
             120.0
             + d.compute_cores * 42.0
             + d.hbm_gb * 1.45
@@ -152,6 +238,41 @@ class DigitalTwinSimulator:
                 cells.append(round(base_c + max(0.0, 4.0 - radial) * 1.7, 2))
             grid.append(cells)
 
+        component_metrics = {}
+        component_temperatures = {}
+        bottlenecks = []
+        if edges := (d.connections or []):
+            min_bw = min(edge.bandwidth_tb_s for edge in edges)
+            bottlenecks = sorted({edge.source for edge in edges if edge.bandwidth_tb_s <= min_bw * 1.001} |
+                                 {edge.target for edge in edges if edge.bandwidth_tb_s <= min_bw * 1.001})
+        for component in d.components or []:
+            local_power = power * (component.compute_tflops / max(topology["compute_tflops"], 1.0)
+                                   if component.type == "compute_cluster" else
+                                   component.capacity_gb / max(topology["hbm_gb"], 1.0)
+                                   if component.type == "hbm" else .04)
+            cx, cy = component.x + component.width / 2.0, component.y + component.height / 2.0
+            center_coupling = max(0.0, 1.0 - (abs(cx - .5) + abs(cy - .5))) * 3.0
+            neighbor_coupling = 0.0
+            for other in d.components or []:
+                if other.id == component.id or other.type != "compute_cluster":
+                    continue
+                ox, oy = other.x + other.width / 2.0, other.y + other.height / 2.0
+                neighbor_coupling += max(0.0, .35 - (abs(cx - ox) + abs(cy - oy))) * 4.0
+            temperature = round(base_c + center_coupling + neighbor_coupling
+                                + min(18.0, local_power / max(component.area_mm2, 1.0) * 4), 2)
+            component_temperatures[component.id] = temperature
+            component_metrics[component.id] = {
+                "type": component.type,
+                "core_count": component.core_count,
+                "compute_tflops": component.compute_tflops,
+                "capacity_gb": component.capacity_gb,
+                "bandwidth_tb_s": component.bandwidth_tb_s,
+                "dma_engines": component.dma_engines,
+                "area_mm2": component.area_mm2,
+                "temperature_c": temperature,
+                "wire_length_factor": round(topology["wire_length"], 4),
+            }
+
         return SimulationResult(
             trace_name=workload.name,
             ttft_p50_ms=round(_percentile([o.ttft_ms for o in outcomes], 0.50), 3),
@@ -169,6 +290,21 @@ class DigitalTwinSimulator:
             duration_ms=round(duration, 3),
             completed_requests=len(outcomes),
             request_outcomes=outcomes,
+            topology_valid=True,
+            topology_errors=[],
+            bottleneck_component_ids=bottlenecks,
+            component_metrics=component_metrics,
+            component_temperatures=component_temperatures,
+        )
+
+    def _invalid_result(self, trace_name: str, errors: List[str]) -> SimulationResult:
+        """Invalid architectures are explicit failed runs, never scored as wins."""
+        return SimulationResult(
+            trace_name=trace_name, ttft_p50_ms=0, ttft_p95_ms=0, ttft_p99_ms=0,
+            throughput_tokens_s=0, memory_fit=False, peak_memory_gb=0, power_w=0,
+            area_mm2=0, max_temperature_c=0,
+            thermal_grid=[[0.0 for _ in range(8)] for _ in range(8)], throttling=False,
+            topology_valid=False, topology_errors=errors,
         )
 
     def _empty_result(self, trace_name: str) -> SimulationResult:

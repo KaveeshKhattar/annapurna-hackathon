@@ -19,6 +19,52 @@ def test_baseline_and_replay_are_deterministic():
     assert first.completed_requests == 12
     assert first.area_mm2 > 0
     assert first.max_temperature_c == max(max(row) for row in first.thermal_grid)
+    assert first.topology_valid
+    assert sum(c.capacity_gb for c in design.components if c.type == "hbm") == 96
+    assert len([c for c in design.components if c.type == "compute_cluster"]) == 4
+    assert len(first.component_metrics) == len(design.components)
+    assert first.component_temperatures
+
+
+def test_connection_bandwidth_changes_simulated_score():
+    design = HardwareDesign.baseline()
+    slower_connections = [
+        edge.model_copy(update={"bandwidth_tb_s": 0.1})
+        if edge.target.startswith("compute-") else edge
+        for edge in design.connections
+    ]
+    constrained = design.model_copy(update={"connections": slower_connections})
+    fast_result = DigitalTwinSimulator().evaluate(design, "A")
+    constrained_result = DigitalTwinSimulator().evaluate(constrained, "A")
+    assert constrained_result.topology_valid
+    assert constrained_result.ttft_p50_ms > fast_result.ttft_p50_ms
+    assert constrained_result.throughput_tokens_s < fast_result.throughput_tokens_s
+
+
+def test_floorplan_placement_changes_wire_latency_and_temperature():
+    design = HardwareDesign.baseline()
+    moved_components = [
+        component.model_copy(update={"x": 0.35}) if component.id == "sbuf-0" else component
+        for component in design.components
+    ]
+    moved = design.model_copy(update={"components": moved_components})
+    baseline_result = DigitalTwinSimulator().evaluate(design, "A")
+    moved_result = DigitalTwinSimulator().evaluate(moved, "A")
+    assert moved_result.topology_valid
+    assert moved_result.ttft_p50_ms != baseline_result.ttft_p50_ms
+    assert moved_result.component_temperatures != baseline_result.component_temperatures
+
+
+def test_disconnected_compute_topology_fails_simulation():
+    design = HardwareDesign.baseline()
+    disconnected = design.model_copy(update={
+        "connections": [edge for edge in design.connections if edge.target != "compute-3"]
+    })
+    result = DigitalTwinSimulator().evaluate(disconnected, "A")
+    assert not result.topology_valid
+    assert any("compute-3 has no HBM path" in error for error in result.topology_errors)
+    assert not result.memory_fit
+    assert result.throughput_tokens_s == 0
 
 
 def test_memory_overflow_and_power_throttle_are_reported():
