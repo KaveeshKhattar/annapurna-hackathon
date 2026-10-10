@@ -5,11 +5,18 @@ the chip it runs on** for a serving problem you pick. Each attempt is graded by 
 checker built from measurements of that same chip, and the grade plus the reason
 feed the next attempt.
 
-```text
- measure live chip ──► calibrate simulator ──► model proposes a chip ──► checker grades it
-                                                     ▲                        │
-                                                     └──── grade + reason ◄───┘
+```mermaid
+flowchart LR
+    A["Live Trainium2 seat<br/>gpt-oss-20b on vLLM"] -->|replay 8 streamed requests| B["Measure<br/>Prometheus · neuron-monitor<br/>· system trace"]
+    B --> C["Calibrate the simulator<br/>host vs device time,<br/>memory footprint"]
+    C --> D["Model proposes a chip<br/>plan → floorplan → wiring"]
+    D --> E{"Checker<br/>score + 6 gates"}
+    E -->|grade + reason<br/>with absolute targets| D
+    E -->|best design| F["Solution<br/>today vs winner"]
 ```
+
+![Cost-down result: today's chip vs the winning design, measured on seat-32](docs/images/05-solution-cost-down.png)
+<sub>A real cost-down run on seat-32: the die shrinks 457 → 294 mm² while p99 latency and throughput hold. Orange outlines mark blocks the agent changed.</sub>
 
 It follows the hackathon's brief (*a model attempts something, a checker grades
 it, and the grade plus the reason feed the next attempt*) and ships the three
@@ -34,6 +41,8 @@ reshaped:
 | Batch throughput | higher tokens/s | same; p99 TTFT ≤ today | 2× outputs, saturated |
 | Power-capped part | lower p99 TTFT | 350 W, 75 °C, 450 mm²; ≥ 70% of today's throughput | 60% load |
 | Cost-down | smaller die | same as chat; p99 TTFT ≤ today and throughput ≥ today | as measured |
+
+![The five scenarios](docs/images/01-problem.png)
 
 "Today's chip" is a Trainium2-like reference: 4 compute clusters, 96 GB of HBM at
 2.9 TB/s, and 24 GB of SRAM. If it already breaks a scenario's budget (the
@@ -92,6 +101,12 @@ the live chip** before the first attempt:
 | `neuron-monitor` (1 s samples during the replay) | NeuronCore utilization, device memory in use |
 | Neuron Explorer **system trace** | NeuronCores busy during traffic (99.7%), on-device prefill (244 ms) and decode step (35.6 ms), collectives (1.3% of execution), host copies, HBM in use (49.7 GB) |
 
+![Live replay: request lanes fill as tokens stream; tokens/s and NeuronCore utilization update](docs/images/02-measure-streaming.png)
+<sub>The measure phase, live: each lane is one request to gpt-oss-20b (amber = prefill, blue = decoding), with tokens/s and NeuronCore utilization streaming in.</sub>
+
+![Measured: the problem stated in numbers](docs/images/03-measured-problem.png)
+<sub>When the replay finishes, the tiles switch to measured values and the problem is stated in numbers, with the bottleneck behind it.</sub>
+
 Calibration (`CampaignOrchestrator._calibrate`):
 
 - **Host vs device time.** Each measured time is split into on-device time (from
@@ -147,6 +162,24 @@ rejected one. A relative "drop 1 core" was once misapplied: the model went from
 6 to 12 cores. Guidance is also objective-aware: area searches never get "raise
 bandwidth" advice.
 
+### One iteration, end to end
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant M as gpt-oss-20b
+    participant C as Checker
+    O->>M: plan (measured signals, best design, history, last feedback)
+    M-->>O: totals + intended changes
+    O->>M: floorplan: assign blocks to die regions
+    M-->>O: regions (checked; one repair with exact errors)
+    O->>M: wiring: links + bandwidths
+    M-->>O: links (max-flow checked; repaired or widened)
+    O->>C: simulate on the calibrated workload
+    C-->>O: score, 6 gates, diagnosis with absolute targets
+    O->>M: next round starts from the best design + this feedback
+```
+
 Checks also run **inside** each attempt. The floorplan and wiring stages are
 validated as soon as the model answers; each gets one repair with the exact
 errors (e.g. `hbm-1 is an HBM stack and must sit on a die edge`), then a
@@ -158,6 +191,9 @@ deterministic fallback that is recorded in the log.
 
 Every attempt is recorded with its design, score, every gate (value against
 limit), the exact feedback sent to the model, and every model call:
+
+![Explore: the checker's limits, a live model-call ticker, and one card per iteration](docs/images/04-explore-live.png)
+<sub>The explore phase: the score and limits as chips, each model call streaming its token count, and one card per iteration (today's chip on the left, the next design in progress).</sub>
 
 | Where | What |
 | --- | --- |
