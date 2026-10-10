@@ -52,6 +52,31 @@ class DigitalTwinSimulator:
 
     def __init__(self, design: HardwareDesign | None = None):
         self.design = design or HardwareDesign.baseline()
+        # Set from live measurements (see CampaignOrchestrator._calibrate): the scales map
+        # roofline time onto measured Trainium prefill/decode time; spill_fraction is the share of
+        # HBM traffic the system trace attributes to SRAM spills.
+        self.calibration: Dict[str, float] = {"prefill_scale": 1.0, "decode_scale": 1.0, "spill_fraction": 0.05}
+
+    def _memory_multiplier(self) -> float:
+        """Spill traffic grows as on-chip SRAM shrinks relative to the 24 GB reference."""
+        spill = float(self.calibration.get("spill_fraction", 0.05))
+        return 1.0 + spill * min(4.0, max(0.25, 24.0 / max(self.design.sbuf_gb, 1e-3)))
+
+    def _roofline(self, prompt_tokens: int | None) -> tuple[float, float]:
+        """Return (compute_ms, memory_ms) for a prefill, or a decode step when prompt_tokens is None."""
+        d = self.design
+        topology = getattr(self, "_active_topology", None) or self._topology_profile()
+        params = d.model_size_b * 1e9
+        if prompt_tokens is None:
+            flops = 2.0 * params
+            bytes_moved = params * d.weight_bytes_per_parameter + 4096.0
+        else:
+            # Attention makes prefill work grow faster than a linear token pass.
+            flops = 2.0 * params * prompt_tokens * (1.0 + min(prompt_tokens, 8192) / 4096.0)
+            bytes_moved = params * d.weight_bytes_per_parameter + prompt_tokens * 4096.0
+        compute_ms = flops / (topology["compute_tflops"] * 1e12 * d.utilization) * 1000.0
+        memory_ms = bytes_moved * self._memory_multiplier() / (topology["hbm_bandwidth"] * 1e12) * 1000.0
+        return compute_ms, memory_ms
 
     def _topology_profile(self):
         """Summarize resources and the HBM-to-compute max-flow in the graph."""
@@ -130,28 +155,18 @@ class DigitalTwinSimulator:
         }
 
     def _prefill_ms(self, prompt_tokens: int) -> float:
-        d = self.design
         topology = getattr(self, "_active_topology", None) or self._topology_profile()
-        params = d.model_size_b * 1e9
-        # Attention makes prefill work grow faster than a linear token pass.
-        flops = 2.0 * params * prompt_tokens * (1.0 + min(prompt_tokens, 8192) / 4096.0)
-        compute_ms = flops / (topology["compute_tflops"] * 1e12 * d.utilization) * 1000.0
-        # A streaming weight pass plus activation traffic; bytes and bandwidth
-        # use decimal units so the stated 2.9 TB/s baseline is literal.
-        bytes_moved = params * d.weight_bytes_per_parameter + prompt_tokens * 4096.0
-        memory_ms = bytes_moved / (topology["hbm_bandwidth"] * 1e12) * 1000.0
-        return max(compute_ms, memory_ms, 0.05) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04
+        # Bytes and bandwidth use decimal units so the stated 2.9 TB/s baseline is literal.
+        compute_ms, memory_ms = self._roofline(prompt_tokens)
+        scale = float(self.calibration.get("prefill_scale", 1.0))
+        return (max(compute_ms, memory_ms, 0.05) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04) * scale
 
     def _decode_token_ms(self, concurrent: int = 1) -> float:
-        d = self.design
         topology = getattr(self, "_active_topology", None) or self._topology_profile()
-        params = d.model_size_b * 1e9
-        flops = 2.0 * params
-        compute_ms = flops / (topology["compute_tflops"] * 1e12 * d.utilization) * 1000.0
         # Each step streams weights once and reads per-sequence KV state.
-        bytes_moved = params * d.weight_bytes_per_parameter + concurrent * 4096.0
-        memory_ms = bytes_moved / (topology["hbm_bandwidth"] * 1e12) * 1000.0
-        return max(compute_ms, memory_ms, 0.01) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04
+        compute_ms, memory_ms = self._roofline(None)
+        scale = float(self.calibration.get("decode_scale", 1.0))
+        return (max(compute_ms, memory_ms, 0.01) + topology["hops"] * 0.01 + topology["wire_length"] * 0.04) * scale
 
     def evaluate(
         self,
@@ -273,8 +288,20 @@ class DigitalTwinSimulator:
                 "wire_length_factor": round(topology["wire_length"], 4),
             }
 
+        typical_prompt = sorted(r.prompt_tokens for r in workload.requests)[len(workload.requests) // 2]
+        prefill_c, prefill_m = self._roofline(typical_prompt)
+        decode_c, decode_m = self._roofline(None)
+        p_scale = float(self.calibration.get("prefill_scale", 1.0))
+        d_scale = float(self.calibration.get("decode_scale", 1.0))
+
         return SimulationResult(
             trace_name=workload.name,
+            prefill_compute_ms=round(prefill_c * p_scale, 4), prefill_memory_ms=round(prefill_m * p_scale, 4),
+            decode_compute_ms=round(decode_c * d_scale, 4), decode_memory_ms=round(decode_m * d_scale, 4),
+            prefill_bound="compute" if prefill_c >= prefill_m else "memory",
+            decode_bound="compute" if decode_c >= decode_m else "memory",
+            raw_power_w=round(raw_power, 2),
+            usable_hbm_bandwidth_tb_s=round(topology["hbm_bandwidth"], 4),
             ttft_p50_ms=round(_percentile([o.ttft_ms for o in outcomes], 0.50), 3),
             ttft_p95_ms=round(_percentile([o.ttft_ms for o in outcomes], 0.95), 3),
             ttft_p99_ms=round(_percentile([o.ttft_ms for o in outcomes], 0.99), 3),

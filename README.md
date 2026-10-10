@@ -74,6 +74,55 @@ Trainium or a model endpoint.
 | `ACCELTWIN_DB_PATH` | `./data/acceltwin.db` | Local SQLite database |
 | `ACCELTWIN_EVENT_LOG` | `./data/events.jsonl` | Append-only audit trail |
 | `ACCELTWIN_MAX_ROUNDS` | `5` | Safety cap for the design loop |
+| `ACCELTWIN_LLM_TIMEOUT` | `240` | Seconds per model call |
+| `ACCELTWIN_LLM_MAX_TOKENS` | `3000` | Output budget per call, including gpt-oss reasoning |
+| `ACCELTWIN_LLM_REASONING_EFFORT` | `low` | gpt-oss reasoning effort; empty to omit |
+| `ACCELTWIN_LLM_JSON_MODE` | `false` | Send `response_format: json_object` |
+| `ACCELTWIN_REPLAY_REQUESTS` | `8` | Requests replayed to measure the live workload |
+| `ACCELTWIN_REPLAY_CONCURRENCY` | `4` | Requests in flight during the replay |
+| `ACCELTWIN_NEURON_TRACE_DIR` | `/workspace/neuron-trace` | Neuron Explorer capture to summarize |
+
+## What the checker measures
+
+Each run starts by replaying a short burst (8 requests, 4 at a time) against the
+live vLLM server and measuring it three ways:
+
+| Source | What is used |
+| --- | --- |
+| vLLM Prometheus `/metrics` (before/after deltas) | TTFT p50/p99, queue, prefill, per-output-token time, prompt and output tokens per request, KV-cache peak, model weight size |
+| `neuron-monitor` (1 s samples during the replay) | NeuronCore utilization, device memory in use |
+| Neuron Explorer system trace (`neuron-explorer view --output-format summary-json`) | arithmetic intensity vs. ridge point, HBM bandwidth utilization, DMA active time, SRAM spill share |
+
+vllm-neuron does not populate its FLOPs/bytes counters, so arithmetic intensity
+comes from the system trace. To capture one, start vLLM with
+`NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_OUTPUT_DIR=/workspace/neuron-trace`
+(or set `ACCELTWIN_NEURON_TRACE_DIR`). Missing sources are shown as such and the
+simulator falls back to defaults for them.
+
+The measurements calibrate the simulator (prefill and decode time scales, model
+size, spill share) and shape the evaluation workload: 32 requests in bursts at
+about 80% of the baseline's capacity. Every design is scored on p99 TTFT and must
+pass throughput, memory, power, temperature, area and layout gates. Failures go
+back to the model with the limiting resource and an absolute target, e.g.
+"decode is memory-bound … raise HBM bandwidth" or "fits at compute_cores <= 7".
+
+## How a design round works
+
+`gpt-oss-20b` is served with an 8k context, so one round is split into small,
+validated calls (`app/agent.py`) instead of one call for the whole chip graph:
+
+1. **Plan** picks architecture totals (clusters, cores, TFLOPS, HBM, SRAM, DMA,
+   utilization, power, cooling) and states the intended changes.
+2. **Floorplan** assigns each block to a die region (an edge or the centre);
+   code packs regions into exact, overlap-free boxes and keeps unchanged regions
+   where they were.
+3. **Interconnect** wires the placed blocks; wiring that cannot carry the HBM
+   bandwidth to compute is sent back, then widened.
+
+Code derives each block's resources from the plan totals, so the graph always
+matches its scalar fields. Each stage that fails validation gets one repair call
+with the exact errors. If the repair still fails, a deterministic layout or wiring
+is used and the round's `steps` record it.
 
 ## Project map
 

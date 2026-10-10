@@ -1,305 +1,616 @@
-(() => {
-  'use strict';
-  const $ = (selector) => document.querySelector(selector);
-  const NS = 'http://www.w3.org/2000/svg';
-  const graph = $('#chip-graph');
-  const roundsNode = $('#round-list');
-  const svg = $('#chip-canvas');
-  const campaignButton = $('#start-campaign');
-  const die = { x: 58, y: 47, width: 884, height: 510 };
-  const history = [];
-  let currentDesign = null;
-  let currentMetrics = null;
-  let currentTopologyErrors = [];
-  let selectedComponentId = null;
-  let eventSource = null;
-  let fallbackTimer = null;
-  let fallbackIndex = 0;
-  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+'use strict';
 
-  // Local examples are complete graphs, so static/offline mode demonstrates the builder itself.
-  const examples = [
-    {name:'Balanced inference die',rationale:'Two compute clusters share a central SRAM bank and dual HBM channels through a compact fabric.',components:[
-      {id:'compute-0',type:'compute',label:'Compute cluster 0',x:.27,y:.18,width:.27,height:.28,compute_tflops:680,utilization:.64,area_mm2:118},
-      {id:'compute-1',type:'compute',label:'Compute cluster 1',x:.56,y:.18,width:.27,height:.28,compute_tflops:680,utilization:.79,area_mm2:118},
-      {id:'sram-0',type:'sram',label:'Shared SRAM',x:.39,y:.53,width:.22,height:.17,capacity_gb:24,bandwidth_tb_s:4.2,area_mm2:24},
-      {id:'hbm-0',type:'hbm',label:'HBM stack 0',x:.035,y:.25,width:.16,height:.42,capacity_gb:48,bandwidth_tb_s:1.45,area_mm2:58},
-      {id:'hbm-1',type:'hbm',label:'HBM stack 1',x:.805,y:.25,width:.16,height:.42,capacity_gb:48,bandwidth_tb_s:1.45,area_mm2:58},
-      {id:'fabric-0',type:'interconnect',label:'Die fabric',x:.31,y:.79,width:.38,height:.1,bandwidth_tb_s:5.8,area_mm2:21}
-    ],connections:[{id:'link-h0',source:'hbm-0',target:'sram-0',bandwidth_tb_s:1.45},{id:'link-h1',source:'hbm-1',target:'sram-0',bandwidth_tb_s:1.45},{id:'link-c0',source:'sram-0',target:'compute-0',bandwidth_tb_s:2.9},{id:'link-c1',source:'sram-0',target:'compute-1',bandwidth_tb_s:2.9},{id:'link-f',source:'fabric-0',target:'sram-0',bandwidth_tb_s:5.8}]},
-    {name:'Memory-first wide die',rationale:'Four HBM stacks feed a broad central fabric, with three smaller compute tiles placed around the memory spine.',components:[
-      {id:'hbm-nw',type:'hbm',label:'HBM NW',x:.035,y:.06,width:.17,height:.29,capacity_gb:32,bandwidth_tb_s:1.2},
-      {id:'hbm-sw',type:'hbm',label:'HBM SW',x:.035,y:.63,width:.17,height:.29,capacity_gb:32,bandwidth_tb_s:1.2},
-      {id:'hbm-ne',type:'hbm',label:'HBM NE',x:.795,y:.06,width:.17,height:.29,capacity_gb:32,bandwidth_tb_s:1.2},
-      {id:'hbm-se',type:'hbm',label:'HBM SE',x:.795,y:.63,width:.17,height:.29,capacity_gb:32,bandwidth_tb_s:1.2},
-      {id:'fabric-spine',type:'fabric',label:'Memory fabric',x:.25,y:.39,width:.5,height:.2,bandwidth_tb_s:8.0},
-      {id:'compute-n',type:'compute',label:'Compute north',x:.35,y:.1,width:.3,height:.21,compute_tflops:520,utilization:.72},
-      {id:'compute-c',type:'compute',label:'Compute center',x:.35,y:.395,width:.3,height:.19,compute_tflops:520,utilization:.88},
-      {id:'compute-s',type:'compute',label:'Compute south',x:.35,y:.69,width:.3,height:.21,compute_tflops:520,utilization:.61}
-    ],connections:[{id:'l1',source:'hbm-nw',target:'fabric-spine',bandwidth_tb_s:1.2},{id:'l2',source:'hbm-sw',target:'fabric-spine',bandwidth_tb_s:1.2},{id:'l3',source:'hbm-ne',target:'fabric-spine',bandwidth_tb_s:1.2},{id:'l4',source:'hbm-se',target:'fabric-spine',bandwidth_tb_s:1.2},{id:'l5',source:'fabric-spine',target:'compute-n',bandwidth_tb_s:2.4},{id:'l6',source:'fabric-spine',target:'compute-c',bandwidth_tb_s:2.4},{id:'l7',source:'fabric-spine',target:'compute-s',bandwidth_tb_s:2.4}]},
-    {name:'Chiplet mesh',rationale:'Four chiplets connect through a mesh ring; local caches reduce pressure on the two HBM stacks.',components:[
-      {id:'chiplet-0',type:'compute',label:'Compute chiplet 0',x:.22,y:.13,width:.24,height:.26,compute_tflops:760,utilization:.55},
-      {id:'chiplet-1',type:'compute',label:'Compute chiplet 1',x:.54,y:.13,width:.24,height:.26,compute_tflops:760,utilization:.69},
-      {id:'chiplet-2',type:'compute',label:'Compute chiplet 2',x:.22,y:.61,width:.24,height:.26,compute_tflops:760,utilization:.82},
-      {id:'chiplet-3',type:'compute',label:'Compute chiplet 3',x:.54,y:.61,width:.24,height:.26,compute_tflops:760,utilization:.73},
-      {id:'cache-0',type:'sram',label:'L3 cache west',x:.04,y:.37,width:.16,height:.18,capacity_gb:18,bandwidth_tb_s:3.1},
-      {id:'cache-1',type:'sram',label:'L3 cache east',x:.80,y:.37,width:.16,height:.18,capacity_gb:18,bandwidth_tb_s:3.1},
-      {id:'hbm-a',type:'hbm',label:'HBM A',x:.29,y:.38,width:.16,height:.16,capacity_gb:64,bandwidth_tb_s:1.8},
-      {id:'hbm-b',type:'hbm',label:'HBM B',x:.55,y:.38,width:.16,height:.16,capacity_gb:64,bandwidth_tb_s:1.8}
-    ],connections:[{id:'m1',source:'chiplet-0',target:'chiplet-1',bandwidth_tb_s:2.5},{id:'m2',source:'chiplet-1',target:'chiplet-3',bandwidth_tb_s:2.5},{id:'m3',source:'chiplet-3',target:'chiplet-2',bandwidth_tb_s:2.5},{id:'m4',source:'chiplet-2',target:'chiplet-0',bandwidth_tb_s:2.5},{id:'m5',source:'chiplet-0',target:'cache-0',bandwidth_tb_s:1.5},{id:'m6',source:'chiplet-2',target:'cache-0',bandwidth_tb_s:1.5},{id:'m7',source:'chiplet-1',target:'cache-1',bandwidth_tb_s:1.5},{id:'m8',source:'chiplet-3',target:'cache-1',bandwidth_tb_s:1.5},{id:'m9',source:'hbm-a',target:'chiplet-0',bandwidth_tb_s:1.8},{id:'m10',source:'hbm-b',target:'chiplet-3',bandwidth_tb_s:1.8}]}
-  ];
+// Hard limits sent with every run; the checker enforces them.
+const CONSTRAINTS = { max_power_w: 600, max_temperature_c: 85, max_area_mm2: 650 };
+const MAX_ROUNDS = 5;
+const POLL_MS = 1500;
+const STEPS = ['measure', 'calibrate', 'plan', 'floorplan', 'wire', 'simulate', 'done'];
 
-  const format = (value, digits=1) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined,{maximumFractionDigits:digits}) : '—';
-  const normalize = (design) => {
-    if (!design || typeof design !== 'object') return null;
-    const inner = design.design && typeof design.design === 'object' ? design.design : design;
-    const components = inner.components;
-    const connections = inner.connections;
-    if (!Array.isArray(components) || !Array.isArray(connections)) return { ...inner, components:[], connections:[], legacy:true };
-    return {...inner, components, connections, legacy:false};
-  };
-  const esc = (value) => String(value ?? '');
-  const svgNode = (name, attrs={}) => {
-    const node = document.createElementNS(NS,name);
-    Object.entries(attrs).forEach(([key,value])=>node.setAttribute(key,String(value)));
-    return node;
-  };
-  const appendText = (parent, x, y, text, className, anchor='middle') => {
-    const node=svgNode('text',{x,y,'text-anchor':anchor,class:className}); node.textContent=esc(text); parent.append(node); return node;
-  };
-  const metricFor = (id) => currentMetrics?.component_metrics?.[id] || currentMetrics?.component_metrics?.find?.(item=>item.component_id===id || item.id===id) || {};
-  const componentHeat = (component) => {
-    const m=metricFor(component.id); const temp=Number(m.temperature_c ?? m.temp_c ?? currentMetrics?.component_temperatures?.[component.id]);
-    const util=Number(m.utilization ?? m.utilization_fraction ?? component.utilization);
-    if (Number.isFinite(temp)) return temp>=90?'hot':temp>=75?'warm':'cool';
-    if (Number.isFinite(util)) return util>=.85?'hot':util>=.65?'warm':'cool';
-    return '';
-  };
-  const kind = (type) => {
-    const s=String(type||'other').toLowerCase();
-    if (/compute|core|tensor/.test(s)) return 'compute';
-    if (/hbm|memory|dram/.test(s)) return 'memory';
-    if (/sram|cache|buffer/.test(s)) return 'cache';
-    if (/fabric|interconnect|switch|noc|dma|io/.test(s)) return 'fabric';
-    return 'other';
-  };
-  const topologyCheck = (design, extraErrors=[]) => {
-    const errors=[]; const ids=new Set();
-    const backendErrors=[...(design.topology_errors || design.validation_errors || []),...(currentMetrics?.topology_errors || []),...(extraErrors||[])];
-    if (Array.isArray(backendErrors)) errors.push(...backendErrors.map(String));
-    design.components.forEach((c,i)=>{
-      if (!c || !c.id) { errors.push(`Component ${i+1} is missing an ID.`); return; }
-      const id=String(c.id); if(ids.has(id)) errors.push(`Duplicate component ID: ${id}.`); ids.add(id);
-      const box=['x','y','width','height'].map(k=>Number(c[k]));
-      if(!box.every(Number.isFinite) || box[0]<0 || box[1]<0 || box[2]<=0 || box[3]<=0 || box[0]+box[2]>1.00001 || box[1]+box[3]>1.00001) errors.push(`${id} has invalid die geometry.`);
-    });
-    design.connections.forEach((link,i)=>{
-      const src=link.source ?? link.from; const dst=link.target ?? link.to;
-      if(!ids.has(String(src)) || !ids.has(String(dst))) errors.push(`Connection ${link.id || i+1} points to a missing component.`);
-      if(String(src)===String(dst)) errors.push(`Connection ${link.id || i+1} loops back to itself.`);
-    });
-    return [...new Set(errors)];
-  };
-  const summaryDiff = (before, after) => {
-    if (!before) return `${after.components.length} components and ${after.connections.length} links in the first proposed topology.`;
-    const oldC=new Map(before.components.map(c=>[String(c.id),c])); const newC=new Map(after.components.map(c=>[String(c.id),c]));
-    const added=[...newC.keys()].filter(id=>!oldC.has(id)); const removed=[...oldC.keys()].filter(id=>!newC.has(id));
-    const moved=[];
-    for(const [id,c] of newC){const old=oldC.get(id); if(old && ['x','y','width','height'].some(k=>Math.abs(Number(old[k])-Number(c[k]))>.005)) moved.push(id);}
-    const oldLinks=new Set(before.connections.map(c=>`${c.source ?? c.from}>${c.target ?? c.to}`));
-    const newLinks=new Set(after.connections.map(c=>`${c.source ?? c.from}>${c.target ?? c.to}`));
-    const addedLinks=[...newLinks].filter(l=>!oldLinks.has(l)).length; const removedLinks=[...oldLinks].filter(l=>!newLinks.has(l)).length;
-    const parts=[];
-    if(added.length) parts.push(`added ${added.length} block${added.length===1?'':'s'} (${added.slice(0,2).join(', ')})`);
-    if(removed.length) parts.push(`removed ${removed.length} block${removed.length===1?'':'s'} (${removed.slice(0,2).join(', ')})`);
-    if(moved.length) parts.push(`repositioned ${moved.length} block${moved.length===1?'':'s'}`);
-    if(addedLinks || removedLinks) parts.push(`${addedLinks} links added, ${removedLinks} removed`);
-    if(!parts.length) parts.push('component positions and connections match the previous proposal');
-    return parts.join(' · ')+'.';
-  };
-  const point = (component, side) => {
-    const x=die.x+Number(component.x)*die.width, y=die.y+Number(component.y)*die.height;
-    const w=Number(component.width)*die.width, h=Number(component.height)*die.height;
-    if(side==='left')return{x,y:y+h/2}; if(side==='right')return{x:x+w,y:y+h/2}; if(side==='top')return{x:x+w/2,y}; if(side==='bottom')return{x:x+w/2,y:y+h};
-    return{x:x+w/2,y:y+h/2};
-  };
-  const connectionPath = (a,b) => {
-    const p=point(a,'center'),q=point(b,'center'); const bendX=Math.round((p.x+q.x)/2);
-    return `M ${p.x} ${p.y} H ${bendX} V ${q.y} H ${q.x}`;
-  };
-  const showValidation = (errors, legacy=false) => {
-    const box=$('#validation-box'); const ul=$('#validation-messages'); ul.replaceChildren();
-    box.classList.toggle('valid',!legacy&&!errors.length); box.classList.toggle('invalid',legacy||errors.length>0);
-    $('#validation-title').textContent=legacy?'Legacy design':errors.length?'Invalid topology':'Topology valid';
-    const messages=legacy?['This proposal has scalar hardware settings but no components / connections graph.']:errors.length?errors:['All component IDs, connection endpoints, and die bounds are valid.'];
-    messages.forEach(msg=>{const li=document.createElement('li');li.textContent=msg;ul.append(li);});
-    $('#schema-status').className=`schema-status ${legacy||errors.length?'invalid':'valid'}`;
-    $('#schema-status span').textContent=legacy?'Legacy fields only':errors.length?'Topology errors':'Components + connections';
-    $('#topology-status').className=`validity-chip ${legacy||errors.length?'invalid':'valid'}`;
-    $('#topology-status span').textContent=legacy?'Legacy design':errors.length?'Invalid topology':'Topology valid';
-  };
+const BLOCK_STYLE = {
+  compute_cluster: ['var(--compute-fill)', 'var(--compute-stroke)', 'Compute'],
+  hbm: ['var(--hbm-fill)', 'var(--hbm-stroke)', 'HBM'],
+  sbuf: ['var(--sbuf-fill)', 'var(--sbuf-stroke)', 'SRAM'],
+  dma: ['var(--dma-fill)', 'var(--dma-stroke)', 'DMA'],
+  router: ['#f4f4f5', '#a1a1aa', 'Router'],
+  io: ['#f4f4f5', '#a1a1aa', 'I/O'],
+};
+const SHORT = {
+  'HBM bandwidth': 'HBM BW', 'HBM capacity': 'HBM', 'Compute cores': 'Cores', 'Compute': 'TFLOPS',
+  'On-chip SRAM': 'SRAM', 'DMA engines': 'DMA', 'Utilization': 'Util', 'Power limit': 'Power cap',
+  'Cooling': 'Cooling', 'Compute clusters': 'Clusters', 'HBM stacks': 'HBM stacks', 'Links': 'Links',
+};
 
-  const drawDesign = (design, options={}) => {
-    const normalized=normalize(design); if(!normalized)return;
-    const previous=currentDesign; currentDesign=normalized;
-    if(options.resetMetrics){currentMetrics=null;currentTopologyErrors=[];}
-    if(options.topologyErrors) currentTopologyErrors=options.topologyErrors;
-    if(options.metrics) currentMetrics=options.metrics;
-    const legacy=normalized.legacy;
-    const errors=legacy?[]:topologyCheck(normalized,currentTopologyErrors);
-    $('#design-title').textContent=normalized.name || options.title || 'LLM proposed accelerator';
-    $('#design-name').textContent=normalized.name || `Round ${options.round || '—'}`;
-    $('#design-rationale').textContent=normalized.rationale || options.feedback || (legacy?'This saved design predates the component topology schema.':'Exact component geometry from the current LLM proposal.');
-    $('#design-round').textContent=options.badge || (options.round ? `ROUND ${options.round}` : 'DESIGN');
-    $('#canvas-count').textContent=legacy?'NO GRAPH':`${normalized.components.length} COMPONENTS · ${normalized.connections.length} LINKS`;
-    $('#canvas-empty').hidden=!legacy;
-    $('#canvas-caption').innerHTML=legacy?'<i class="pulse-dot"></i>Topology graph unavailable':'<i class="pulse-dot"></i>Showing exact proposed component geometry';
-    if(legacy){graph.replaceChildren();$('#empty-detail').textContent='This is a legacy scalar-only design. The application will not invent a chip diagram; a component graph is required.';}
-    else renderGraph(normalized,errors);
-    showValidation(errors,legacy);
-    $('#change-summary').textContent=legacy?'This design has no graph to compare. Add components and connections to visualize the proposed chip.':summaryDiff(previous && !previous.legacy ? previous : null,normalized);
-    if(options.metrics) applyMetrics(options.metrics);
-    renderConnections(normalized,errors);
-    updateInspector(selectedComponentId);
-    if(options.animate && !reducedMotion){graph.classList.remove('design-fade'); void graph.getBoundingClientRect(); graph.classList.add('design-fade');}
-  };
+const state = { campaignId: null, rendered: new Set(), entries: new Map(), selected: null, timer: null, baseline: null };
+const $ = (id) => document.getElementById(id);
 
-  const renderGraph = (design, errors) => {
-    graph.replaceChildren();
-    graph.append(svgNode('rect',{x:die.x,y:die.y,width:die.width,height:die.height,rx:20,class:'die-outline'}));
-    graph.append(svgNode('rect',{x:die.x+8,y:die.y+8,width:die.width-16,height:die.height-16,rx:14,class:'die-outline-inner'}));
-    appendText(graph,die.x+12,die.y-15,'DIE FLOORPLAN','die-label-svg','start');
-    appendText(graph,die.x+die.width-12,die.y-15,`${design.components.length} BLOCKS`,'die-label-svg','end');
-    const byId=new Map(design.components.filter(c=>c?.id).map(c=>[String(c.id),c]));
-    const invalidIDs=new Set();
-    design.connections.forEach((link,i)=>{const a=byId.get(String(link.source ?? link.from));const b=byId.get(String(link.target ?? link.to));if(!a||!b){if(a)invalidIDs.add(String(a.id));if(b)invalidIDs.add(String(b.id));return;}
-      const pathD=connectionPath(a,b); const path=svgNode('path',{d:pathD,class:'connection-path flow-dash','marker-end':'url(#arrowhead)'});path.dataset.connection=link.id||i;path.setAttribute('aria-label',`${link.source ?? link.from} to ${link.target ?? link.to}`);graph.append(path);
-      const midpoint=svgNode('circle',{r:3,class:'flow-dot'});const animate=svgNode('animateMotion',{dur:'2.4s',repeatCount:'indefinite',path:pathD});midpoint.append(animate);graph.append(midpoint);
-      if(Number.isFinite(Number(link.bandwidth_tb_s))) appendText(graph,(point(a,'center').x+point(b,'center').x)/2,(point(a,'center').y+point(b,'center').y)/2-5,`${format(link.bandwidth_tb_s,2)} TB/s`,'component-util');
-    });
-    const bottlenecks=new Set([...(currentMetrics?.bottleneck_component_ids||[]),...(currentMetrics?.bottleneck_components||[]).map(v=>typeof v==='string'?v:v.id)] .filter(Boolean).map(String));
-    const invalidIDFromErrors=(id)=>errors.some(error=>String(error).includes(id));
-    design.components.slice().sort((a,b)=>Number(a?.layer||0)-Number(b?.layer||0)).forEach((c,index)=>{
-      if(!c || !Number.isFinite(Number(c.x))||!Number.isFinite(Number(c.y))||!Number.isFinite(Number(c.width))||!Number.isFinite(Number(c.height)))return;
-      const x=die.x+Number(c.x)*die.width,y=die.y+Number(c.y)*die.height,w=Math.max(3,Number(c.width)*die.width),h=Math.max(3,Number(c.height)*die.height);
-      const g=svgNode('g',{class:`component-group${bottlenecks.has(String(c.id))?' bottleneck':''}${invalidIDs.has(String(c.id))||invalidIDFromErrors(c.id)?' invalid':''}${selectedComponentId===String(c.id)?' selected':''}`,tabindex:'0',role:'button','aria-label':`${c.label||c.id}, ${c.type||'component'}`, 'data-component-id':c.id});
-      g.append(svgNode('rect',{x,y,width:w,height:h,rx:Math.min(9,Math.max(3,h*.09)),class:`component-shell ${kind(c.type)} ${componentHeat(c)?`heat-${componentHeat(c)}`:''}`}));
-      if(bottlenecks.has(String(c.id)))appendText(g,x+w-9,y+15,'!','bottleneck-badge');
-      if(invalidIDs.has(String(c.id))||invalidIDFromErrors(c.id))appendText(g,x+9,y+15,'×','invalid-mark','start');
-      const label=String(c.label||c.name||c.id); const maxChars=Math.max(7,Math.floor(w/7));
-      appendText(g,x+w/2,y+h/2-2,label.length>maxChars?`${label.slice(0,maxChars-1)}…`:label,'component-label');
-      const facts=[]; if(c.capacity_gb!=null)facts.push(`${format(c.capacity_gb,1)} GB`);if(c.compute_tflops!=null)facts.push(`${format(c.compute_tflops,0)} TFLOP/s`);if(c.bandwidth_tb_s!=null)facts.push(`${format(c.bandwidth_tb_s,2)} TB/s`);
-      if(facts.length&&h>45)appendText(g,x+w/2,y+h/2+15,facts.slice(0,2).join(' · '),'component-sub-label');
-      const m=metricFor(c.id);const util=Number(m.utilization??m.utilization_fraction??c.utilization);
-      if(Number.isFinite(util)&&h>56)appendText(g,x+w/2,y+h-8,`${Math.round(util*100)}% utilization`,'component-util');
-      const click=()=>{selectedComponentId=String(c.id);updateInspector(selectedComponentId);graph.querySelectorAll('.component-group').forEach(n=>n.classList.toggle('selected',n.dataset.componentId===selectedComponentId));};
-      g.addEventListener('click',click);g.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();click();}});graph.append(g);
-    });
-  };
-  const renderConnections=(design,errors)=>{
-    const list=$('#connection-list');list.replaceChildren();
-    if(design.legacy||!design.connections.length){const span=document.createElement('span');span.className='muted';span.textContent=design.legacy?'No graph available in legacy design':'No links in this design';list.append(span);return;}
-    const ids=new Set(design.components.map(c=>String(c.id)));
-    design.connections.forEach((link,i)=>{const row=document.createElement('div');const from=String(link.source??link.from??'?'),to=String(link.target??link.to??'?');const invalid=!ids.has(from)||!ids.has(to);row.className=`connection-item${invalid?' invalid':''}`;
-      const strong=document.createElement('b');strong.textContent=`${from} → ${to}`;row.append(strong);
-      const info=[];if(link.bandwidth_tb_s!=null)info.push(`${format(link.bandwidth_tb_s,2)} TB/s`);if(link.latency_ns!=null)info.push(`${format(link.latency_ns,1)} ns`);if(link.label)info.push(String(link.label));const detail=document.createElement('span');detail.textContent=` · ${info.join(' · ')||link.id||`Link ${i+1}`}`;row.append(detail);list.append(row);
-    });
-  };
-  const updateInspector=(id)=>{
-    const c=currentDesign&&!currentDesign.legacy?currentDesign.components.find(item=>String(item.id)===String(id)):null;
-    $('#inspector-count').textContent=`${currentDesign?.components.length||0} blocks`;
-    $('#inspector-empty').hidden=!!c;$('#inspector-content').hidden=!c;if(!c)return;
-    $('#component-name').textContent=c.label||c.name||c.id;$('#component-type').textContent=c.type||'component';
-    const icons={compute:'▦',memory:'▤',cache:'▥',fabric:'⌘',other:'◇'};$('#component-icon').textContent=icons[kind(c.type)];
-    const rows=[['ID',c.id],['Position',`${format(c.x*100,1)}%, ${format(c.y*100,1)}%`],['Footprint',`${format(c.width*100,1)}% × ${format(c.height*100,1)}%`],['Compute',c.compute_tflops==null?null:`${format(c.compute_tflops,1)} TFLOP/s`],['Capacity',c.capacity_gb==null?null:`${format(c.capacity_gb,1)} GB`],['Bandwidth',c.bandwidth_tb_s==null?null:`${format(c.bandwidth_tb_s,2)} TB/s`],['DMA engines',c.dma_engines],['Area',c.area_mm2==null?null:`${format(c.area_mm2,1)} mm²`],['Layer',c.layer]];
-    const dl=$('#component-properties');dl.replaceChildren();rows.filter(([,v])=>v!=null).forEach(([label,value])=>{const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=String(value);dl.append(dt,dd);});
-    const m=metricFor(c.id);const temp=m.temperature_c??m.temp_c??currentMetrics?.component_temperatures?.[c.id];const util=m.utilization??m.utilization_fraction??c.utilization;const bottleneck=Boolean((currentMetrics?.bottleneck_component_ids||[]).map(String).includes(String(c.id)));
-    const parts=[];if(temp!=null)parts.push(`Simulated temperature ${format(temp,1)} °C`);if(util!=null)parts.push(`Utilization ${format(Number(util)*100,0)}%`);if(bottleneck)parts.push('Checker bottleneck: this block is limiting the current design.');$('#component-telemetry').textContent=parts.join(' · ')||'No component-specific simulation telemetry yet.';
-  };
-  const applyMetrics=(metrics)=>{
-    if(!metrics)return;currentMetrics=metrics;
-    const value=(...keys)=>{for(const key of keys)if(metrics[key]!=null)return metrics[key];return null;};
-    $('#metric-ttft').textContent=format(value('ttft_p99_ms','p99_ttft_ms','predicted_p99_ttft_ms'));
-    $('#metric-throughput').textContent=format(value('throughput_tokens_s','throughput_tokens_per_second','throughput_toks_s'),0);
-    $('#metric-power').textContent=format(value('power_w','power_watts'),0);
-    $('#metric-temp').textContent=format(value('max_temperature_c','temperature_c','temp_c'),1);
-    $('#metric-area').textContent=format(value('area_mm2','estimated_area_mm2'),1);
-    const gates=metrics.gate_results;const accepted=metrics.accepted;
-    $('#checker-note').textContent=metrics.feedback||metrics.rationale||(accepted===true?'This design passed the simulation gates.':accepted===false?'This candidate did not pass every simulation gate.':gates?`Checker gates: ${Object.entries(gates).map(([k,v])=>`${k} ${v?'pass':'fail'}`).join(' · ')}`:'Simulation metrics are attached to this design.');
-    if(currentDesign&&!currentDesign.legacy){const errors=topologyCheck(currentDesign,currentTopologyErrors);renderGraph(currentDesign,errors);updateInspector(selectedComponentId);}
-  };
-  const renderHistory=()=>{
-    roundsNode.replaceChildren();$('#round-counter').textContent=`${history.length} proposal${history.length===1?'':'s'}`;
-    if(!history.length){const empty=document.createElement('div');empty.className='round-empty';empty.textContent='Each LLM proposal and checker result will appear here.';roundsNode.append(empty);return;}
-    history.slice().reverse().forEach((entry,index)=>{const originalIndex=history.length-index;const row=document.createElement('button');row.type='button';row.className=`round-item ${entry.status}${entry.selected?' selected':''}`;
-      const n=document.createElement('span');n.className='round-index';n.textContent=String(entry.round||originalIndex);const copy=document.createElement('span');copy.className='round-copy';const b=document.createElement('b');b.textContent=entry.name||`Design round ${entry.round||originalIndex}`;const sm=document.createElement('small');sm.textContent=entry.status==='proposed'?'LLM proposed · awaiting simulation':entry.feedback||entry.status;copy.append(b,sm);const score=document.createElement('span');score.className='round-score';const strong=document.createElement('strong');strong.textContent=entry.status==='proposed'?'PENDING':entry.status==='rejected'?'REJECTED':entry.improved?'BEST':'EVALUATED';const meta=entry.metrics?.ttft_p99_ms??entry.metrics?.p99_ttft_ms;if(meta!=null)score.append(strong,document.createTextNode(`${format(meta,1)} ms`));else score.append(strong);row.append(n,copy,score);
-      row.addEventListener('click',()=>{history.forEach(e=>e.selected=false);entry.selected=true;drawDesign(entry.design,{round:entry.round,badge:entry.improved?'BEST DESIGN':`ROUND ${entry.round||originalIndex}`,metrics:entry.metrics,topologyErrors:entry.topologyErrors,feedback:entry.feedback,title:entry.name,animate:true});renderHistory();});roundsNode.append(row);
-    });
-  };
-  const upsertHistory=(data,status)=>{
-    const round=Number(data.round||data.attempt?.round||1);const design=normalize(data.design||data.attempt?.design||data);if(!design)return null;
-    let entry=history.find(item=>item.round===round);if(!entry){entry={id:data.id||data.attempt_id||data.attempt?.id,round,design,status:'proposed',name:data.name||data.attempt?.name||design.name,selected:true};history.forEach(e=>e.selected=false);history.push(entry);}else{entry.id=data.id||data.attempt_id||data.attempt?.id||entry.id;entry.design=design;entry.name=data.name||data.attempt?.name||entry.name||design.name;}
-    entry.status=status||entry.status;entry.feedback=data.feedback||data.attempt?.feedback||entry.feedback;entry.metrics=data.metrics||data.attempt?.metrics||entry.metrics;entry.topologyErrors=data.topology_errors||data.attempt?.topology_errors||entry.topologyErrors||[];entry.improved=Boolean(data.improved||data.attempt?.improved);entry.accepted=data.accepted??data.attempt?.accepted??entry.accepted;
-    renderHistory();return entry;
-  };
-  const applyState=(state)=>{
-    if(!state||typeof state!=='object')return;
-    const design=state.design||state.current_design||state.best_design||state.best_attempt?.design||state.campaign?.best_attempt?.design;
-    const metrics=state.metrics||state.simulation||state.best_attempt?.metrics||state.campaign?.best_attempt?.metrics;
-    if(design)drawDesign(design,{metrics,round:state.round||state.campaign?.current_round,badge:state.best_design?'BEST DESIGN':undefined});else if(metrics)applyMetrics(metrics);
-    if(state.connected===false){$('#connection-label').textContent='Demo mode';$('.live-status').classList.add('disconnected');}
-    else if(state.connected===true){$('#connection-label').textContent='API connected';$('.live-status').classList.remove('disconnected');}
-    if(state.campaign)applyCampaign(state.campaign);
-  };
-  const applyCampaign=(campaign)=>{
-    if(!campaign)return;const count=campaign.rounds??campaign.current_step??campaign.total_steps??0;
-    if(campaign.status==='running'){campaignButton.disabled=true;$('#campaign-button-label').textContent='Building…';$('#loop-status').className='loop-status running';$('#loop-status span:last-child').textContent=`Round ${count||1} · simulation loop running`;}
-    else if(campaign.status==='completed'){campaignButton.disabled=false;$('#campaign-button-label').textContent='Build another chip';$('#loop-status').className='loop-status done';$('#loop-status span:last-child').textContent='Design loop complete';}
-    else {campaignButton.disabled=false;$('#campaign-button-label').textContent='Build and test chip';}
-  };
-  const api=async(path,options={})=>{const response=await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});if(!response.ok)throw new Error(`${path}: ${response.status}`);return response.status===204?null:response.json();};
-  const stopFallback=()=>{if(fallbackTimer){clearInterval(fallbackTimer);fallbackTimer=null;}};
-  const startFallback=()=>{
-    $('#connection-label').textContent='Example designs';$('.live-status').classList.add('disconnected');
-    const show=()=>{const design=examples[fallbackIndex%examples.length];fallbackIndex+=1;drawDesign(design,{round:fallbackIndex,badge:'EXAMPLE',metrics:{component_metrics:Object.fromEntries(design.components.map(c=>[c.id,{utilization:c.utilization??.42,temperature_c:c.utilization?55+c.utilization*35:58}]))},animate:true});$('#design-title').textContent=design.name;$('#design-name').textContent=design.name;};
-    show();fallbackTimer=setInterval(show,8500);
-  };
-  const connect=async()=>{
-    for(const path of ['/api/state','/api/overview']){try{const state=await api(path);stopFallback();applyState(state);$('#connection-label').textContent='API connected';$('.live-status').classList.remove('disconnected');return;}catch(_){}}
-    try{await api('/api/health');$('#connection-label').textContent='API connected';$('.live-status').classList.remove('disconnected');}catch(_){startFallback();}
-  };
-  const connectEvents=(campaignId)=>{
-    if(!('EventSource'in window))return;
-    if(eventSource)eventSource.close();eventSource=new EventSource(`/api/events/${encodeURIComponent(campaignId)}`);
-    eventSource.onopen=()=>{$('#connection-label').textContent='Live AI loop';$('.live-status').classList.remove('disconnected');};
-    const handle=async(event)=>{let data;try{data=JSON.parse(event.data);}catch(_){return;}
-      if(event.type==='design.proposed'){
-        stopFallback();const entry=upsertHistory(data,'proposed');if(entry)drawDesign(entry.design,{round:entry.round,badge:`ROUND ${entry.round}`,feedback:data.rationale,metrics:data.metrics,resetMetrics:true,animate:true});$('#loop-status').className='loop-status running';$('#loop-status span:last-child').textContent=`Round ${data.round||1} · proposed by AI`;$('#connection-label').textContent='LLM proposed design';
-      }else if(event.type==='design.evaluated'||event.type==='design.rejected'){
-        const status=event.type==='design.rejected'?'rejected':'evaluated';const entry=upsertHistory(data,status);if(entry){drawDesign(entry.design,{round:entry.round,badge:`ROUND ${entry.round}`,metrics:entry.metrics,topologyErrors:entry.topologyErrors,feedback:entry.feedback,animate:true});if(entry.metrics)applyMetrics(entry.metrics);}
-        $('#loop-status').className='loop-status running';$('#loop-status span:last-child').textContent=`Round ${data.round||1} · checker feedback received`;
-      }else if(event.type==='campaign.best_updated'){
-        const attemptId=String(data.attempt_id||data.id||'');const entry=(data.design||data.attempt?.design)?upsertHistory(data,'evaluated'):history.find(item=>attemptId&&String(item.id)===attemptId);
-        if(entry){entry.improved=true;history.forEach(item=>item.selected=item===entry);renderHistory();drawDesign(entry.design,{round:entry.round,badge:'BEST DESIGN',metrics:data.metrics||entry.metrics,topologyErrors:entry.topologyErrors,feedback:entry.feedback,animate:true});}
-        else {$('#design-round').textContent='BEST DESIGN';if(data.metrics)applyMetrics(data.metrics);}
-        $('#loop-status').className='loop-status running';$('#loop-status span:last-child').textContent='Best feasible design updated';
-      }else if(event.type==='campaign.completed'){
-        applyCampaign({status:'completed',rounds:data.rounds});$('#loop-status').className='loop-status done';$('#loop-status span:last-child').textContent=data.stop_reason||'Design loop complete';
-        try{const finalCampaign=await api(`/api/campaigns/${encodeURIComponent(campaignId)}`);const best=finalCampaign.best_attempt;if(best?.design){const entry=upsertHistory(best,'evaluated');if(entry){entry.improved=true;history.forEach(item=>item.selected=item===entry);renderHistory();drawDesign(entry.design,{round:entry.round,badge:'BEST DESIGN',metrics:entry.metrics,topologyErrors:entry.topologyErrors,feedback:entry.feedback,animate:true});}}}catch(_){}
-        eventSource.close();
-      }else if(event.type==='campaign.started'){$('#loop-status').className='loop-status running';$('#loop-status span:last-child').textContent='LLM preparing first design';}
-    };
-    ['campaign.started','design.proposed','design.evaluated','design.rejected','campaign.best_updated','campaign.completed'].forEach(type=>eventSource.addEventListener(type,handle));
-    eventSource.onerror=()=>{if(eventSource.readyState===EventSource.CONNECTING)$('#connection-label').textContent='Reconnecting…';};
-  };
+// ------------------------------------------------------------------ helpers
 
-  $('#start-campaign').addEventListener('click',async()=>{
-    stopFallback();campaignButton.disabled=true;$('#campaign-button-label').textContent='Starting…';const trace=$('#workload-select').value;let result;
-    const goal=$('#design-goal').value.trim()||'Minimize p99 TTFT without reducing throughput';
-    for(const path of ['/api/campaigns','/api/campaigns/start','/api/campaign/start']){try{result=await api(path,{method:'POST',body:JSON.stringify({goal,trace,max_rounds:5,constraints:{max_power_w:600,max_temperature_c:90,max_area_mm2:700}})});break;}catch(_){}}
-    if(result){applyCampaign(result.campaign||result);if(result.id)connectEvents(result.id);$('#connection-label').textContent='Campaign started';}
-    else{campaignButton.disabled=false;$('#campaign-button-label').textContent='Build and test chip';$('#loop-status').className='loop-status';$('#loop-status span:last-child').textContent='Service unavailable · showing example designs';startFallback();}
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === 'class') node.className = value;
+    else if (key === 'style') node.style.cssText = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children.flat(Infinity)) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : String(child));
+  }
+  return node;
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svg(tag, attrs = {}, text) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const fmt = (v, digits = 0) => (num(v) === null ? '—' : v.toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits }));
+const short = (v) => (num(v) === null ? '—' : Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : +v.toPrecision(3));
+
+function fmtMs(v) {
+  if (num(v) === null) return '—';
+  if (v >= 1000) return `${(v / 1000).toFixed(v >= 10000 ? 1 : 2)} s`;
+  return v < 10 ? `${v.toFixed(2)} ms` : `${Math.round(v)} ms`;
+}
+function pct(value, base) {
+  return num(value) === null || !num(base) ? null : ((value - base) / base) * 100;
+}
+const signed = (p, digits = 1) => `${p > 0 ? '+' : '−'}${Math.abs(p).toFixed(digits)}%`;
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function countUp(node, to, render, ms = 900) {
+  if (num(to) === null || reducedMotion()) { node.textContent = render(to); return; }
+  const start = performance.now();
+  const tick = (now) => {
+    const t = Math.min(1, (now - start) / ms);
+    node.textContent = render(to * (1 - Math.pow(1 - t, 3)));
+    if (t < 1) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+function transition(update) {
+  if (document.startViewTransition && !reducedMotion()) document.startViewTransition(update);
+  else update();
+}
+
+// ------------------------------------------------------------------ diagram
+
+function blockLabel(c) {
+  const index = Number(String(c.id).split('-').pop());
+  if (c.type === 'sbuf') return 'SRAM';
+  const name = (BLOCK_STYLE[c.type] || [])[2] || c.type;
+  return Number.isFinite(index) ? `${name} ${index + 1}` : c.id;
+}
+function blockValue(c) {
+  if (c.type === 'compute_cluster' && c.compute_tflops) return `${Math.round(c.compute_tflops)} TF`;
+  if (c.type === 'hbm' && c.capacity_gb) return `${+c.capacity_gb.toFixed(1)} GB · ${+c.bandwidth_tb_s.toFixed(2)} TB/s`;
+  if (c.type === 'sbuf' && c.capacity_gb) return `${+c.capacity_gb.toFixed(1)} GB`;
+  if (c.type === 'dma' && c.dma_engines > 1) return `×${c.dma_engines}`;
+  return '';
+}
+
+function drawDiagram(design, changedIds = [], previousBoxes = {}) {
+  const S = 300, P = 10;
+  const root = svg('svg', { viewBox: `0 0 ${S + 2 * P} ${S + 2 * P}`, role: 'img', 'aria-label': 'Chip floorplan' });
+  const components = (design && design.components) || [];
+  const connections = (design && design.connections) || [];
+  const changed = new Set(changedIds || []);
+  const box = (c) => ({ x: P + c.x * S, y: P + c.y * S, w: c.width * S, h: c.height * S });
+
+  root.append(svg('rect', { x: P, y: P, width: S, height: S, rx: 12, fill: '#fff', stroke: '#e4e4e7' }));
+  for (const c of components.filter((c) => c.type === 'noc')) {
+    const b = box(c);
+    root.append(svg('rect', { x: b.x, y: b.y, width: b.w, height: b.h, rx: 8, fill: '#f4f4f5', stroke: '#d4d4d8', 'stroke-dasharray': '4 3' }));
+  }
+
+  const byId = Object.fromEntries(components.map((c) => [c.id, c]));
+  const maxBw = Math.max(0.01, ...connections.map((e) => e.bandwidth_tb_s || 0));
+  for (const edge of connections) {
+    const a = byId[edge.source], b = byId[edge.target];
+    if (!a || !b) continue;
+    const pa = box(a), pb = box(b);
+    root.append(svg('line', { class: 'link-line', x1: pa.x + pa.w / 2, y1: pa.y + pa.h / 2, x2: pb.x + pb.w / 2, y2: pb.y + pb.h / 2,
+      'stroke-width': (0.8 + 2.6 * (edge.bandwidth_tb_s || 0) / maxBw).toFixed(2) }));
+  }
+
+  // Ghost outlines where moved blocks used to sit.
+  for (const [id, [x, y, w, h]] of Object.entries(previousBoxes || {})) {
+    const now = byId[id];
+    if (!now || (Math.abs(now.x - x) < 0.006 && Math.abs(now.y - y) < 0.006 && Math.abs(now.width - w) < 0.006)) continue;
+    root.append(svg('rect', { class: 'ghost', x: P + x * S, y: P + y * S, width: w * S, height: h * S, rx: 5 }));
+  }
+
+  components.filter((c) => c.type !== 'noc').forEach((c, i) => {
+    const b = box(c);
+    const [fill, stroke] = BLOCK_STYLE[c.type] || BLOCK_STYLE.io;
+    const isChanged = changed.has(c.id);
+    const g = svg('g', { class: isChanged ? 'blk blk-changed' : 'blk', style: `animation-delay:${i * 25}ms` });
+    g.append(svg('rect', { x: b.x, y: b.y, width: b.w, height: b.h, rx: 5, fill,
+      stroke: isChanged ? 'var(--changed)' : stroke, 'stroke-width': isChanged ? 2.4 : 1.2 }));
+    const size = Math.max(6, Math.min(11, b.w / 6.5, b.h / 2.4));
+    const value = blockValue(c);
+    // Only draw the value line when it fits inside the block at this size.
+    const twoLines = value && b.h > size * 3.2 && b.w - 6 > value.length * size * 0.85 * 0.62;
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    g.append(svg('text', { x: cx, y: twoLines ? cy - size * 0.25 : cy + size * 0.35, 'text-anchor': 'middle',
+      'font-size': size, 'font-weight': 600, 'font-family': 'Geist, sans-serif', fill: '#18181b' }, blockLabel(c)));
+    if (twoLines) {
+      g.append(svg('text', { x: cx, y: cy + size * 1.05, 'text-anchor': 'middle', 'font-size': size * 0.85,
+        'font-family': 'Geist Mono, monospace', fill: '#71717a' }, value));
+    }
+    root.append(g);
   });
-  const marker=svgNode('defs');const markerArrow=svgNode('marker',{id:'arrowhead',viewBox:'0 0 10 10',refX:'8',refY:'5',markerWidth:'5',markerHeight:'5',orient:'auto-start-reverse'});markerArrow.append(svgNode('path',{d:'M 0 0 L 10 5 L 0 10 z',fill:'#73bdf2'}));marker.append(markerArrow);svg.insertBefore(marker,graph);
-  connect();
-})();
+  return root;
+}
+
+// ------------------------------------------------------------- attempt bits
+
+const failedChecks = (attempt) => (attempt.checks || []).filter((row) => row.passed === false);
+
+function checkText(row) {
+  if (row.key === 'topology_valid') return 'Invalid layout or wiring';
+  return `${row.label} ${short(row.value)} ${row.op === '≥' ? '<' : '>'} ${short(row.limit)} ${row.unit}`;
+}
+
+function verdict(entry) {
+  const a = entry.attempt;
+  if (entry.isBaseline) return { text: 'Baseline', cls: '' };
+  if (a.duplicate) return { text: 'Duplicate', cls: 'fail' };
+  if (!a.metrics) return { text: 'No design', cls: 'fail' };
+  if (!a.accepted) return { text: 'Rejected', cls: 'fail' };
+  return a.improved ? { text: 'New best', cls: 'pass' } : { text: 'Not faster', cls: '' };
+}
+
+function deltaChip(d) {
+  if (d.kind === 'layout' || num(d.pct) === null) return el('span', { class: 'chip layout' }, d.text.replace('Moved or resized', 'Moved'));
+  const arrow = d.pct > 0 ? el('span', { class: 'up' }, '▲') : el('span', { class: 'down' }, '▼');
+  return el('span', { class: 'chip' }, `${SHORT[d.label] || d.label} ${short(d.before)}→${short(d.after)}${d.unit ? ' ' + d.unit : ''} `, arrow);
+}
+
+function outcome(entry) {
+  const a = entry.attempt;
+  const m = a.metrics;
+  if (entry.isBaseline) return el('div', { class: 'outcome' }, el('span', {}, 'p99 TTFT'), el('b', {}, fmtMs(m && m.ttft_p99_ms)));
+  if (!m) return el('div', { class: 'outcome' }, el('span', {}, 'No design produced'), el('b', { class: 'bad' }, '✕'));
+  const failed = failedChecks(a);
+  if (failed.length) return el('div', { class: 'outcome' }, el('b', { class: 'bad' }, '✕'), el('span', { class: 'why' }, checkText(failed[0])));
+  const change = pct(m.ttft_p99_ms, state.baseline && state.baseline.ttft_p99_ms);
+  return el('div', { class: 'outcome' }, el('span', {}, 'p99 vs baseline'),
+    el('b', { class: change !== null && change < -0.05 ? 'good' : change > 0.05 ? 'bad' : '' }, change === null ? '—' : signed(change)));
+}
+
+// --------------------------------------------------------------------- tiles
+
+function addTile(entry, index) {
+  state.entries.set(entry.id, entry);
+  const a = entry.attempt;
+  const v = verdict(entry);
+  const item = el('li', { class: `tile${v.cls === 'fail' ? ' rejected' : ''}`, 'data-id': entry.id, style: `animation-delay:${Math.min(index, 4) * 60}ms` },
+    el('button', { type: 'button', 'aria-label': `${entry.label}: show details` },
+      el('div', { class: 'tile-top' }, el('span', { class: 'tile-num' }, entry.label), el('span', { class: `pill ${v.cls}` }, v.text)),
+      el('div', { class: 'tile-title', title: a.name || '' }, entry.isBaseline ? 'Trainium2-like reference' : (a.name || 'Untitled design')),
+      el('div', { class: 'diagram-wrap' }, a.design ? drawDiagram(a.design, a.changed_ids, a.previous_boxes)
+        : el('div', { class: 'skeleton', style: 'animation:none' })),
+      el('div', { class: 'chips' }, entry.isBaseline ? el('span', { class: 'chip' }, 'Starting point') : (a.deltas || []).slice(0, 2).map(deltaChip)),
+      outcome(entry)));
+  item.querySelector('button').addEventListener('click', () => select(entry.id));
+  $('iterations').insertBefore(item, $('iterations').querySelector('.tile.working'));
+}
+
+function setWorkingTile(campaign) {
+  let tile = $('iterations').querySelector('.tile.working');
+  const next = (campaign.attempts || []).length + 1;
+  const running = campaign.status === 'running' && campaign.baseline_metrics && next <= campaign.max_rounds;
+  if (!running) { if (tile) tile.remove(); return; }
+  if (!tile) {
+    tile = el('li', { class: 'tile working' },
+      el('button', { type: 'button', disabled: 'true', tabindex: '-1' },
+        el('div', { class: 'tile-top' }, el('span', { class: 'tile-num' }), el('span', { class: 'pill' }, 'Designing')),
+        el('div', { class: 'tile-title' }, 'The model is working…'),
+        el('div', { class: 'skeleton' }),
+        el('div', { class: 'working-step' })));
+    $('iterations').append(tile);
+  }
+  tile.querySelector('.tile-num').textContent = `Iteration ${next}`;
+  tile.querySelector('.working-step').textContent = (campaign.activity || '').replace(/^Round \d+: /, '');
+}
+
+function select(id) {
+  const same = state.selected === id;
+  transition(() => {
+    state.selected = same ? null : id;
+    for (const tile of document.querySelectorAll('.tile[data-id]')) tile.setAttribute('aria-current', String(tile.dataset.id === state.selected));
+    if (same) { $('detail').hidden = true; return; }
+    $('detail').replaceChildren(detailCard(state.entries.get(id)));
+    $('detail').hidden = false;
+  });
+  if (!same) setTimeout(() => $('detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 60);
+}
+
+// -------------------------------------------------------------------- detail
+
+function deltaRows(deltas) {
+  if (!deltas || !deltas.length) return el('p', { class: 'why-text' }, 'No parameter changes.');
+  return el('div', { class: 'delta-rows' }, deltas.map((d) => el('div', { class: 'delta-row' },
+    el('span', { class: 'name' }, d.kind === 'layout' && num(d.pct) === null ? d.text : d.label),
+    el('span', { class: 'vals' }, d.kind === 'layout' && num(d.pct) === null ? ''
+      : `${short(d.before)} → ${short(d.after)} ${d.unit || ''}${num(d.pct) === null ? '' : '  ' + signed(d.pct, 0)}`),
+    num(d.pct) === null ? null : el('span', { class: 'bar' }, el('i', { style: `width:${Math.min(100, Math.max(4, Math.abs(d.pct)))}%` })))));
+}
+
+function checkList(checks) {
+  return el('ul', { class: 'checks' }, (checks || []).map((row) => el('li', { class: row.passed ? '' : 'fail' },
+    el('span', { class: 'icon' }, row.passed ? '✓' : '✕'),
+    el('span', {}, row.key === 'topology_valid' ? 'Valid layout & wiring' : `${row.label} ${row.op} ${short(row.limit)} ${row.unit}`),
+    el('span', { class: 'val' }, row.key === 'topology_valid' ? 'invalid' : `${short(row.value)} ${row.unit}`))));
+}
+
+function stepChips(steps) {
+  return el('div', { class: 'steps' }, steps.map((s) => el('span', {
+    class: `chip ${s.includes('fallback') ? 'fallback' : s.includes('repaired') ? 'repaired' : ''}` }, s.replace(/ \(automatic fallback.*/, ' · fallback'))));
+}
+
+function metricsBlock(m, isBaseline, animate) {
+  if (m.topology_valid === false) return el('p', { class: 'why-text' }, 'Not simulated: the layout or wiring was invalid.');
+  const change = isBaseline ? null : pct(m.ttft_p99_ms, state.baseline && state.baseline.ttft_p99_ms);
+  const p99 = el('span', {}, fmtMs(m.ttft_p99_ms));
+  const tput = el('span', {}, fmt(m.throughput_tokens_s));
+  if (animate) {
+    countUp(p99, m.ttft_p99_ms, fmtMs);
+    countUp(tput, m.throughput_tokens_s, (v) => fmt(v));
+  }
+  return el('dl', { class: 'metric-row' },
+    el('div', { class: 'metric' }, el('dt', {}, 'p99 time to first token'),
+      el('dd', {}, p99, change === null ? null : el('small', { class: change < 0 ? 'good' : 'bad' }, signed(change)))),
+    el('div', { class: 'metric' }, el('dt', {}, 'Throughput (tok/s)'), el('dd', {}, tput)),
+    el('div', { class: 'metric' }, el('dt', {}, 'Bottleneck'),
+      el('dd', { style: 'font-size:13px;font-weight:500;margin-top:8px' }, `prefill ${m.prefill_bound || '—'} · decode ${m.decode_bound || '—'}`)));
+}
+
+function detailCard(entry, { winner = false } = {}) {
+  const a = entry.attempt;
+  const v = verdict(entry);
+  const pill = winner ? el('span', { class: 'pill best' }, 'Winner') : el('span', { class: `pill ${v.cls}` }, v.text);
+  const deltas = winner && !entry.isBaseline ? a.baseline_deltas : a.deltas;
+  const why = entry.isBaseline
+    ? 'The reference chip: 4 compute clusters, 2 HBM stacks with 96 GB at 2.9 TB/s, 24 GB SRAM. Every iteration starts from the best chip found so far.'
+    : (a.rationale || (a.changes || [])[0] || a.feedback || '');
+
+  const story = el('div', { class: 'detail-col' },
+    el('div', { class: 'detail-head' }, el('span', { class: 'tile-num' }, entry.label), pill),
+    el('h3', {}, entry.isBaseline ? 'Baseline' : (a.name || 'Untitled design')),
+    why ? el('section', {}, el('h4', {}, 'Why'), el('p', { class: 'why-text' }, why)) : null,
+    entry.isBaseline ? null : el('section', {}, el('h4', {}, winner ? 'What changed vs. baseline' : 'What changed'), deltaRows(deltas)),
+    a.steps && a.steps.length ? el('section', {}, el('h4', {}, 'Model calls this round'), stepChips(a.steps)) : null);
+
+  const result = el('div', { class: 'detail-col' },
+    a.metrics ? el('section', {}, el('h4', {}, 'Simulated result'), metricsBlock(a.metrics, entry.isBaseline, winner)) : null,
+    a.checks && a.checks.length ? el('section', {}, el('h4', {}, 'Checker'), checkList(a.checks)) : null,
+    a.feedback && !entry.isBaseline ? el('section', {}, el('h4', {}, 'Feedback sent to the model'), el('pre', { class: 'feedback' }, a.feedback)) : null);
+
+  const withDiagram = winner && a.design;
+  return el('article', { class: `card detail-card${withDiagram ? ' with-diagram' : ''}${winner ? ' winner-card' : ''}` },
+    withDiagram ? el('div', { class: 'diagram-wrap' }, drawDiagram(a.design, a.changed_ids, a.previous_boxes)) : null,
+    story, result);
+}
+
+// ------------------------------------------------------------------- checker
+
+function kv(rows) {
+  return el('dl', { class: 'kv' }, rows.filter(Boolean).map(([k, v]) => [el('dt', {}, k), el('dd', {}, v)]));
+}
+
+function source(title, data, rows, captureHint) {
+  const ok = data && data.available;
+  return el('div', { class: 'source' },
+    el('div', { class: 'source-head' }, el('span', {}, title), el('span', { class: `tag ${ok ? 'measured' : 'missing'}` }, ok ? 'measured' : 'not available')),
+    ok ? kv(rows) : el('p', { class: 'missing-note' }, (data && data.reason) || 'Not collected.',
+      captureHint ? ['. To capture it, start vLLM with ', el('code', {}, captureHint), '.'] : null));
+}
+
+function renderChecker(campaign) {
+  const t = campaign.telemetry || {};
+  const v = t.vllm || {}, n = t.neuron_monitor || {}, s = t.system_trace || {};
+  const cal = campaign.calibration || {};
+  const base = campaign.baseline_metrics || {};
+
+  const measured = el('div', { class: 'card checker-col', style: '--i:0' },
+    el('h3', {}, el('span', { class: 'num' }, '1'), 'Measured on your Trainium'),
+    source('vLLM · Prometheus /metrics', v, [
+      ['TTFT p50 / p99', `${fmtMs(v.ttft_p50_ms)} / ${fmtMs(v.ttft_p99_ms)}`],
+      ['Queue · prefill', `${fmtMs(v.queue_ms)} · ${fmtMs(v.prefill_ms)}`],
+      ['Per output token', fmtMs(v.inter_token_ms)],
+      ['Tokens in / out', `${fmt(v.prompt_tokens_mean)} / ${fmt(v.generation_tokens_mean)}`],
+      ['KV cache peak', `${fmt(v.kv_cache_peak_pct, 1)}%`],
+      ['Replay', `${v.requests || 0} requests in ${fmt(v.wall_s, 1)} s`],
+    ]),
+    source('neuron-monitor', n, [
+      ['NeuronCore busy', `${fmt(n.core_utilization_pct)}% avg · ${fmt(n.core_utilization_peak_pct)}% peak`],
+      ['Device memory', `${fmt(n.device_memory_gb, 1)} / ${fmt(n.device_memory_total_gb)} GB`],
+      num(n.effective_tflops) !== null ? ['Effective TFLOPS', fmt(n.effective_tflops, 1)] : null,
+      ['Device', `${n.device_type || '—'} · ${n.cores || '—'} cores`],
+    ]),
+    source('Neuron Explorer system trace', s, [
+      ['Arithmetic intensity', `${fmt(s.arithmetic_intensity, 1)} FLOP/B`],
+      ['Ridge point', `${fmt(s.ridge_point)} FLOP/B`],
+      ['HBM bandwidth used (MBU)', `${fmt(s.mbu_pct)}%`],
+      ['DMA active', `${fmt(s.dma_active_pct)}%`],
+      ['SRAM spill share', `${fmt((s.spill_fraction || 0) * 100, 1)}%`],
+    ], 'NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_OUTPUT_DIR=/workspace/neuron-trace'));
+
+  const live = cal.live;
+  const calibrated = el('div', { class: 'card checker-col', style: '--i:1' },
+    el('h3', {}, el('span', { class: 'num' }, '2'), 'Simulator, calibrated to it'),
+    el('div', { class: 'source' },
+      el('div', { class: 'source-head' }, el('span', {}, 'Fitted to the measurements'),
+        el('span', { class: `tag ${live ? 'modeled' : 'missing'}` }, live ? 'calibrated' : 'defaults')),
+      kv([
+        ['Prefill time scale', `×${fmt(cal.prefill_scale, 2)}`],
+        ['Decode time scale', `×${fmt(cal.decode_scale, 2)}`],
+        ['SRAM spill share', `${fmt((cal.spill_fraction || 0) * 100, 1)}% (${cal.spill_source || 'default'})`],
+        ['Model weights', num(cal.model_weights_gb) === null ? 'default' : `${fmt(cal.model_weights_gb, 1)} GB`],
+      ])),
+    el('div', { class: 'source' },
+      el('div', { class: 'source-head' }, el('span', {}, live ? 'Replayed workload' : 'Workload'), el('span', { class: 'tag modeled' }, 'modeled')),
+      kv([
+        ['Requests', live ? `32 · one every ${fmtMs(cal.arrival_interval_ms)}` : 'fixed trace C'],
+        ['Tokens in / out', `${fmt(cal.prompt_tokens)} / ${fmt(cal.generation_tokens)}`],
+        ['Baseline p99 TTFT', fmtMs(base.ttft_p99_ms)],
+        ['Baseline throughput', `${fmt(base.throughput_tokens_s)} tok/s`],
+      ])),
+    el('div', { class: 'bound-chips' },
+      base.prefill_bound ? el('span', { class: `bound ${base.prefill_bound}` }, `prefill: ${base.prefill_bound}-bound`) : null,
+      base.decode_bound ? el('span', { class: `bound ${base.decode_bound}` }, `decode: ${base.decode_bound}-bound`) : null));
+
+  const gates = (campaign.baseline_checks || []).map((row) => el('li', {},
+    el('span', {}, row.label), el('span', {}, `${row.op} ${short(row.limit)} ${row.unit}`)));
+  const checker = el('div', { class: 'card checker-col', style: '--i:2' },
+    el('h3', {}, el('span', { class: 'num' }, '3'), 'Checker'),
+    el('p', { class: 'objective' }, 'Score: ', el('b', {}, 'lower p99 time-to-first-token'), ' on the replayed workload.'),
+    el('div', { class: 'source' }, el('div', { class: 'source-head' }, el('span', {}, 'Every design must pass')),
+      el('ul', { class: 'gate-list' }, gates, el('li', {}, el('span', {}, 'Layout & wiring'), el('span', {}, 'valid')))),
+    el('p', { class: 'missing-note' }, 'A failed or slower design goes back to the model with the limiting resource and the size of change that would fix it.'));
+
+  $('checker-grid').replaceChildren(measured, calibrated, checker);
+  $('checker').hidden = false;
+}
+
+// --------------------------------------------------------------------- chart
+
+function renderChart(campaign) {
+  const base = campaign.baseline_metrics;
+  const points = [{ x: 0, y: base.ttft_p99_ms, kind: 'base' }];
+  for (const a of campaign.attempts || []) {
+    if (!a.metrics || a.metrics.topology_valid === false) continue;
+    points.push({ x: a.round, y: a.metrics.ttft_p99_ms, kind: a.accepted ? (a.improved ? 'best' : 'ok') : 'bad', id: a.id });
+  }
+  const card = $('chart');
+  if (points.length < 2) { card.hidden = true; return; }
+  const key = JSON.stringify([points, campaign.status]);
+  if (card.dataset.key === key) return;
+  card.dataset.key = key;
+  card.hidden = false;
+  const W = Math.max(320, card.clientWidth - 32), H = 140, L = 58, R = 16, T = 10, B = 22;
+  const maxX = Math.max(campaign.max_rounds, ...points.map((p) => p.x));
+  const ys = points.map((p) => p.y);
+  const lo = Math.min(...ys) * 0.92, hi = Math.max(...ys) * 1.04;
+  const sx = (x) => L + (x / maxX) * (W - L - R);
+  const sy = (y) => T + (1 - (y - lo) / Math.max(hi - lo, 1e-6)) * (H - T - B);
+  const root = svg('svg', { viewBox: `0 0 ${W} ${H}` });
+  const label = { 'font-size': 10, fill: '#a1a1aa', 'font-family': 'Geist Mono, monospace' };
+
+  for (const tick of [lo, (lo + hi) / 2, hi]) {
+    root.append(svg('line', { x1: L, x2: W - R, y1: sy(tick), y2: sy(tick), stroke: '#f4f4f5' }));
+    root.append(svg('text', { ...label, x: L - 8, y: sy(tick) + 4, 'text-anchor': 'end' }, fmtMs(tick)));
+  }
+  for (let i = 0; i <= maxX; i++) root.append(svg('text', { ...label, x: sx(i), y: H - 4, 'text-anchor': 'middle' }, i === 0 ? 'base' : `#${i}`));
+  root.append(svg('line', { x1: L, x2: W - R, y1: sy(base.ttft_p99_ms), y2: sy(base.ttft_p99_ms), stroke: '#d4d4d8', 'stroke-dasharray': '3 4' }));
+
+  // Best-so-far staircase.
+  let best = base.ttft_p99_ms, d = `M ${sx(0)} ${sy(best)}`;
+  for (const p of points.slice(1)) {
+    if (p.kind === 'best' && p.y < best) { d += ` H ${sx(p.x)} V ${sy(p.y)}`; best = p.y; } else d += ` H ${sx(p.x)}`;
+  }
+  root.append(svg('path', { d, class: 'draw', pathLength: 1, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'stroke-linejoin': 'round' }));
+
+  const winnerId = campaign.status === 'completed' && campaign.best_attempt ? campaign.best_attempt.id : null;
+  points.forEach((p, i) => {
+    const color = p.kind === 'bad' ? 'var(--bad)' : p.kind === 'best' ? 'var(--accent)' : p.kind === 'base' ? '#71717a' : '#a1a1aa';
+    root.append(svg('circle', { class: 'pt', cx: sx(p.x), cy: sy(p.y), r: p.id && p.id === winnerId ? 6 : 4,
+      fill: p.kind === 'bad' ? '#fff' : color, stroke: color, 'stroke-width': 1.6, style: `animation-delay:${200 + i * 80}ms` }));
+  });
+
+  const change = pct(best, base.ttft_p99_ms);
+  card.replaceChildren(
+    el('div', { class: 'chart-title' }, el('span', {}, 'p99 time to first token by iteration · lower is better'),
+      el('span', {}, 'Best so far ', el('b', {}, fmtMs(best)), change !== null && change < -0.05 ? ` (${signed(change)})` : '')),
+    root);
+}
+
+// ------------------------------------------------------------------ pipeline
+
+function stepFor(campaign) {
+  if (campaign.status === 'completed') return 'done';
+  const a = (campaign.activity || '').toLowerCase();
+  if (a.includes('measuring')) return 'measure';
+  if (a.includes('calibrat')) return 'calibrate';
+  if (a.includes('placing')) return 'floorplan';
+  if (a.includes('wiring')) return 'wire';
+  if (a.includes('simulating')) return 'simulate';
+  return campaign.baseline_metrics ? 'plan' : 'measure';
+}
+
+function setPipeline(step) {
+  const pipeline = $('pipeline');
+  pipeline.hidden = false;
+  const index = STEPS.indexOf(step);
+  for (const li of pipeline.children) {
+    const i = STEPS.indexOf(li.dataset.step);
+    li.classList.toggle('done', i < index || step === 'done');
+    li.classList.toggle('active', i === index && step !== 'done');
+  }
+}
+
+function setStatus(text, kind = 'running') {
+  const status = $('status');
+  status.hidden = !text;
+  status.textContent = text || '';
+  status.className = `status ${kind}`;
+}
+
+// ------------------------------------------------------------------ campaign
+
+async function api(path, options = {}) {
+  const response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch (_) { /* keep statusText */ }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+function reset() {
+  clearTimeout(state.timer);
+  Object.assign(state, { rendered: new Set(), entries: new Map(), selected: null, baseline: null });
+  $('iterations').replaceChildren();
+  delete $('chart').dataset.key;
+  for (const id of ['detail', 'final', 'timeline', 'checker', 'chart']) $(id).hidden = true;
+}
+
+// The run ID lives in the URL, so a refresh or a shared link reopens the same run.
+function watch(id) {
+  state.campaignId = id;
+  history.replaceState(null, '', `?run=${encodeURIComponent(id)}`);
+  poll();
+}
+
+async function start(event) {
+  event.preventDefault();
+  reset();
+  $('start').disabled = true;
+  setPipeline('measure');
+  setStatus('Checking the model');
+  try {
+    const campaign = await api('/api/campaigns', {
+      method: 'POST',
+      body: JSON.stringify({ goal: $('goal').value.trim(), max_rounds: MAX_ROUNDS, constraints: CONSTRAINTS }),
+    });
+    watch(campaign.id);
+  } catch (error) {
+    $('pipeline').hidden = true;
+    setStatus(`Could not start: ${error.message}`, 'error');
+    $('start').disabled = false;
+  }
+}
+
+function baselineEntry(campaign) {
+  return { id: 'baseline', isBaseline: true, label: 'Baseline', attempt: {
+    name: 'Baseline', design: campaign.baseline_design, metrics: campaign.baseline_metrics, checks: campaign.baseline_checks } };
+}
+
+async function poll() {
+  let campaign;
+  try {
+    campaign = await api(`/api/campaigns/${encodeURIComponent(state.campaignId)}?compact=1`);
+  } catch (error) {
+    if (/not found/i.test(error.message)) {
+      history.replaceState(null, '', location.pathname);
+      $('pipeline').hidden = true;
+      setStatus('That run is no longer on the server. Start a new one.', 'error');
+      $('start').disabled = false;
+      return;
+    }
+    setStatus(`Lost connection, retrying (${error.message})`);
+    state.timer = setTimeout(poll, POLL_MS * 2);
+    return;
+  }
+  if (campaign.baseline_metrics && !state.baseline) {
+    state.baseline = campaign.baseline_metrics;
+    renderChecker(campaign);
+    $('timeline').hidden = false;
+    addTile(baselineEntry(campaign), 0);
+  }
+  let index = state.rendered.size + 1;
+  for (const attempt of campaign.attempts || []) {
+    if (state.rendered.has(attempt.id)) continue;
+    state.rendered.add(attempt.id);
+    addTile({ id: attempt.id, label: `Iteration ${attempt.round}`, attempt }, index++);
+  }
+  setWorkingTile(campaign);
+  if (state.baseline) renderChart(campaign);
+
+  if (campaign.status === 'completed') return finish(campaign);
+  if (campaign.status === 'failed') {
+    setStatus(campaign.error || 'The design run failed.', 'error');
+    $('start').disabled = false;
+    return;
+  }
+  setPipeline(stepFor(campaign));
+  const done = (campaign.attempts || []).length;
+  setStatus(campaign.baseline_metrics
+    ? `${campaign.activity || 'Working'} · ${done} of up to ${campaign.max_rounds} iterations done`
+    : `${campaign.activity || 'Measuring'} · replaying requests on the live model`);
+  state.timer = setTimeout(poll, POLL_MS);
+}
+
+function finish(campaign) {
+  $('start').disabled = false;
+  setPipeline('done');
+  setStatus(campaign.stop_reason ? `Finished: ${campaign.stop_reason}.` : 'Finished.', '');
+  const best = campaign.best_attempt;
+  const winner = best ? state.entries.get(best.id) || { id: best.id, label: `Iteration ${best.round}`, attempt: best }
+    : state.entries.get('baseline') || baselineEntry(campaign);
+  const tile = document.querySelector(`.tile[data-id="${CSS.escape(winner.id)}"]`);
+  if (tile) {
+    tile.classList.add('winner');
+    const pill = tile.querySelector('.pill');
+    pill.className = 'pill best';
+    pill.textContent = 'Winner';
+  }
+  const m = winner.attempt.metrics || {};
+  const change = pct(m.ttft_p99_ms, state.baseline.ttft_p99_ms);
+  const summary = best
+    ? el('p', { class: 'winner-summary' }, `${winner.label} cut p99 time-to-first-token from `,
+      el('b', {}, fmtMs(state.baseline.ttft_p99_ms)), ' to ', el('b', {}, fmtMs(m.ttft_p99_ms)),
+      change === null ? '' : ` (${signed(change)})`, ' while passing every check.')
+    : el('p', { class: 'winner-summary' }, 'No iteration beat the baseline while passing every check, so the baseline stays the best design.');
+  $('report-link').href = `/api/reports/${encodeURIComponent(campaign.id)}`;
+  $('final-card').replaceChildren(el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, summary, detailCard(winner, { winner: true })));
+  transition(() => { $('final').hidden = false; });
+  setTimeout(() => $('final').scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+}
+
+async function loadConfig() {
+  const badge = $('model-badge');
+  try {
+    const config = await api('/api/config');
+    const name = String(config.model || 'model').replace(/^openai\//, '');
+    if (config.mode === 'mock') {
+      $('model-label').textContent = `${name} · offline mode`;
+    } else if (config.ready) {
+      badge.classList.add('live');
+      $('model-label').textContent = name;
+    } else {
+      badge.classList.add('down');
+      $('model-label').textContent = `${name} · not reachable`;
+      setStatus(config.error, 'error');
+    }
+  } catch (_) { /* badge keeps its default */ }
+}
+
+$('brief-form').addEventListener('submit', start);
+loadConfig();
+const resumeId = new URLSearchParams(location.search).get('run');
+if (resumeId) {
+  reset();
+  $('start').disabled = true;
+  setPipeline('measure');
+  watch(resumeId);
+}
