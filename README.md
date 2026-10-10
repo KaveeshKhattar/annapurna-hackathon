@@ -172,7 +172,7 @@ sequenceDiagram
     O->>M: plan (measured signals, best design, history, last feedback)
     M-->>O: totals + intended changes
     O->>M: floorplan: assign blocks to die regions
-    M-->>O: regions (checked; one repair with exact errors)
+    M-->>O: regions (checked, one repair with exact errors)
     O->>M: wiring: links + bandwidths
     M-->>O: links (max-flow checked; repaired or widened)
     O->>C: simulate on the calibrated workload
